@@ -51,7 +51,19 @@ def fetch_image_data_uri(image_url: str) -> str:
         return _IMAGE_DATA_CACHE[cache_key]
 
     try:
-        response = requests.get(image_url, timeout=10)
+        response = requests.get(
+            image_url,
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Referer": image_url,
+            },
+        )
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0]
         encoded = base64.b64encode(response.content).decode("utf-8")
@@ -61,6 +73,7 @@ def fetch_image_data_uri(image_url: str) -> str:
     except Exception as exc:
         logger.warning(f"Failed to fetch image '{image_url}': {exc}")
         return FALLBACK_IMAGE_URL
+
 
 
 def generate_base64_ai_image(news: dict) -> str:
