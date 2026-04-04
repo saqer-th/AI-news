@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import re
@@ -8,17 +10,23 @@ from urllib.parse import urlparse
 
 import requests
 import trafilatura
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    uc = None
 from playwright.sync_api import sync_playwright
+import time
 
 from news_fetcher import ALLOWED_DOMAINS, BUSINESS_PRIORITY, detect_business_bucket, is_allowed_domain
 from utils import setup_logger
 
 logger = setup_logger(__name__)
+_url_cache: dict[str, str | None] = {}
 
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3:8b")
 CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "processed_news.json"
-EXTRACTION_CACHE_VERSION = "2026-04-04-stale-page-date-v3"
+EXTRACTION_CACHE_VERSION = "2026-04-04-sabq-maaal-spa-v4"
 MIN_CONTENT_LENGTH = 300
 ARTICLE_MAX_AGE_DAYS = 7
 LLM_RETRY_LIMIT = 3
@@ -110,6 +118,26 @@ DOMAIN_SELECTORS = {
         ".article-detail-content .ck-editor.article.m-bottom",
         ".article-detail-content .ck-editor.article",
     ],
+    "sabq.org": [
+        '[data-testid="text-article-body"]',
+        "main article",
+        "article",
+        ".prose",
+        ".article-content",
+    ],
+    "maaal.com": [
+        ".td-post-content",
+        ".entry-content",
+        ".post-content",
+        ".article-content",
+        "article",
+    ],
+    "spa.gov.sa": [
+        ".news-details",
+        ".article-content",
+        ".field--name-body",
+        "article",
+    ],
     "alarabiya.net": [
         "main article",
         ".article-body",
@@ -131,6 +159,7 @@ GENERIC_SELECTORS = [
     ".article-content",
     ".entry-content",
     ".post-content",
+    ".td-post-content",
     "#story_body",
     "#news_content",
 ]
@@ -183,36 +212,55 @@ def parse_article_date_text(date_text: str) -> datetime | None:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     normalized = normalized.replace("،", " ").replace(",", " ")
     normalized = re.sub(r"\s+في\s+\d{1,2}:\d{2}\s*[^\s]+", "", normalized)
+    normalized = re.sub(r"\|\s*", " ", normalized)
+
+    def _to_gregorian_year(y: int) -> int:
+        """Convert Hijri year (1380-1480) to approximate Gregorian year."""
+        if 1380 <= y <= 1480:
+            return y + 622 - y // 33
+        return y
 
     iso_match = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", normalized)
     if iso_match:
         year, month, day = map(int, iso_match.groups())
+        year = _to_gregorian_year(year)
         try:
             return datetime(year, month, day, tzinfo=timezone.utc)
         except ValueError:
             return None
 
-    arabic_match = re.search(
-        r"(\d{1,2})\s+([^\s]+)\s+(\d{4})",
+    iso_dash_match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", normalized)
+    if iso_dash_match:
+        year, month, day = map(int, iso_dash_match.groups())
+        year = _to_gregorian_year(year)
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    # Try every date-shaped substring — the first may be a Hijri date with an
+    # unrecognised month name (e.g. 'شوال'), so keep trying until one parses.
+    for arabic_match in re.finditer(
+        r"(\d{1,2})\s+([^\s\d]+?[\u0600-\u06FF][^\s\d]*)\s+(\d{4})",
         normalized,
-    )
-    if arabic_match:
+    ):
         day = int(arabic_match.group(1))
         month_name = arabic_match.group(2).strip().lower()
         year = int(arabic_match.group(3))
+        year = _to_gregorian_year(year)
         month = ARABIC_MONTHS.get(month_name)
         if month:
             try:
                 return datetime(year, month, day, tzinfo=timezone.utc)
             except ValueError:
-                return None
+                continue
 
     return None
 
 
 def is_recent_article_date(article_date: datetime | None, max_age_days: int = ARTICLE_MAX_AGE_DAYS) -> bool:
     if article_date is None:
-        return True
+        return False
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     return article_date >= cutoff
 
@@ -388,66 +436,66 @@ def get_business_priority(title: str, description: str) -> tuple[str, int]:
     return bucket, BUSINESS_PRIORITY[bucket]
 
 
-def resolve_final_url(page, url: str) -> str:
+def resolve_final_url(url: str) -> str | None:
     if not url:
-        return ""
+        return None
 
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        try:
-            page.wait_for_url(lambda current: "google.com" not in current, timeout=8000)
-        except Exception:
-            pass
+    if url in _url_cache:
+        return _url_cache[url]
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-
-        candidates = page.evaluate(
-            """() => {
-                return [
-                    window.location.href,
-                    document.querySelector('link[rel="canonical"]')?.href || "",
-                    document.querySelector('meta[property="og:url"]')?.content || "",
-                    document.querySelector('meta[name="twitter:url"]')?.content || ""
-                ].filter(Boolean);
-            }"""
-        )
-
-        current_url = page.url
-        for candidate in candidates:
-            if candidate.startswith("http") and "google.com" not in candidate:
-                if candidate != current_url:
-                    page.goto(candidate, wait_until="domcontentloaded", timeout=20000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=5000)
-                    except Exception:
-                        pass
-                return page.url
-
-        return current_url
-    except Exception as exc:
-        logger.warning(f"Failed to resolve final URL for {url}: {exc}")
+    if "news.google.com" not in url.lower():
+        _url_cache[url] = url
         return url
-
-
-def resolve_final_url_via_requests(url: str) -> str:
-    if not url:
-        return ""
 
     try:
         response = requests.get(
             url,
-            timeout=15,
-            allow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+            allow_redirects=True,
         )
-        response.raise_for_status()
-        return response.url or url
+        resolved_url = response.url
+        if resolved_url and "news.google.com" not in resolved_url.lower():
+            _url_cache[url] = resolved_url
+            logger.info(f"Resolved Google News URL via requests: {resolved_url}")
+            return resolved_url
     except Exception as exc:
-        logger.warning(f"Requests-based URL resolution failed for {url}: {exc}")
-        return url
+        logger.warning(f"Requests-based Google News resolution failed for {url}: {exc}")
+
+    if uc is None:
+        logger.warning(f"Google News resolution requires Selenium fallback but undetected_chromedriver is unavailable: {url}")
+        _url_cache[url] = None
+        return None
+
+    driver = None
+    try:
+        options = uc.ChromeOptions()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-gpu")
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            driver = uc.Chrome(options=options)
+        driver.get(url)
+        time.sleep(3)
+
+        resolved_url = driver.current_url
+        if resolved_url and "news.google.com" not in resolved_url.lower():
+            _url_cache[url] = resolved_url
+            logger.info(f"Resolved Google News URL via Selenium: {resolved_url}")
+            return resolved_url
+    except Exception as exc:
+        logger.warning(f"Selenium Google News resolution failed for {url}: {exc}")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    _url_cache[url] = None
+    logger.warning(f"Failed to resolve Google News URL: {url}")
+    return None
 
 
 def get_domain_selectors(url: str) -> list[str]:
@@ -632,17 +680,33 @@ def get_article_date_from_page(page) -> datetime | None:
         date_candidates = page.evaluate(
             """() => {
                 return [
+                    ...Array.from(document.querySelectorAll('.flex.items-center.gap-1')).map(node => node.innerText || ""),
                     document.querySelector('[data-testid="text-article-subtitle"]')?.innerText || "",
                     document.querySelector('[data-testid="text-article-date"]')?.innerText || "",
+                    document.querySelector('.text-article-subtitle')?.innerText || "",
+                    document.querySelector('.article-subtitle')?.innerText || "",
+                    document.querySelector('.article-meta')?.innerText || "",
+                    document.querySelector('.article-info')?.innerText || "",
+                    document.querySelector('.entry-date')?.innerText || "",
+                    document.querySelector('.post-date')?.innerText || "",
+                    document.querySelector('.td-post-date')?.innerText || "",
+                    document.querySelector('.single-post-meta')?.innerText || "",
+                    document.querySelector('.news-date')?.innerText || "",
+                    document.querySelector('.date')?.innerText || "",
                     document.querySelector('#articledetail .date-posted')?.innerText || "",
                     document.querySelector('.date-posted')?.innerText || "",
                     document.querySelector('time')?.getAttribute('datetime') || "",
+                    document.querySelector('time[datetime]')?.innerText || "",
                     document.querySelector('time')?.innerText || "",
                     document.querySelector('meta[property="article:published_time"]')?.content || "",
+                    document.querySelector('meta[property="article:modified_time"]')?.content || "",
                     document.querySelector('meta[name="publishdate"]')?.content || "",
                     document.querySelector('meta[name="date"]')?.content || "",
+                    document.querySelector('meta[name="pubdate"]')?.content || "",
+                    document.querySelector('meta[itemprop="datePublished"]')?.content || "",
                     document.querySelector('.published-date')?.innerText || "",
-                    document.querySelector('.article-date')?.innerText || ""
+                    document.querySelector('.article-date')?.innerText || "",
+                    document.querySelector('div.article-time time')?.innerText || "",
                 ].filter(Boolean);
             }"""
         )
@@ -656,21 +720,64 @@ def get_article_date_from_page(page) -> datetime | None:
     return None
 
 
+def extract_sabq_date(page) -> datetime | None:
+    try:
+        date_candidates = page.evaluate(
+            """() => {
+                return Array.from(document.querySelectorAll('.flex.items-center.gap-1'))
+                    .map(node => (node.innerText || '').trim())
+                    .filter(Boolean);
+            }"""
+        )
+    except Exception as exc:
+        logger.warning(f"Sabq date extraction failed while reading page nodes: {exc}")
+        return None
+
+    for candidate in date_candidates:
+        parsed = parse_article_date_text(str(candidate))
+        if parsed is not None:
+            return parsed
+
+    logger.warning("Sabq date extraction failed: no parsable date found in '.flex.items-center.gap-1'.")
+    return None
+
+
 def scrape_full_article(page, url: str) -> tuple[str, str, str, bool]:
-    final_url = resolve_final_url(page, url)
+    final_url = resolve_final_url(url)
     if not final_url or not is_allowed_domain(final_url):
         logger.warning(f"Rejected article after final URL resolution: {final_url or url}")
         return "", "", final_url, False
 
-    article_date = get_article_date_from_page(page)
-    if article_date and not is_recent_article_date(article_date):
-        logger.info(f"Skipping stale article based on page date {article_date.date()}: {final_url}")
-        return "", "", final_url, True
+    try:
+        page.goto(final_url, wait_until="domcontentloaded", timeout=20000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning(f"Failed to load resolved article URL {final_url}: {exc}")
+        return "", "", final_url, False
 
-    selectors = get_domain_selectors(final_url)
     host = urlparse(final_url).netloc.lower()
     if host.startswith("www."):
         host = host[4:]
+
+    if host == "sabq.org" or host.endswith(".sabq.org"):
+        article_date = extract_sabq_date(page)
+        if article_date is None:
+            logger.warning(f"Skipping Sabq article because date extraction failed: {final_url}")
+            return "", "", final_url, True
+    else:
+        article_date = get_article_date_from_page(page)
+
+    if not is_recent_article_date(article_date):
+        if host == "sabq.org" or host.endswith(".sabq.org"):
+            logger.info(f"Skipping stale Sabq article based on page date {article_date.date() if article_date else 'unknown'}: {final_url}")
+        else:
+            logger.info(f"Skipping stale article based on page date {article_date.date() if article_date else 'unknown'}: {final_url}")
+        return "", "", final_url, True
+
+    selectors = get_domain_selectors(final_url)
 
     if host == "argaam.com" or host.endswith(".argaam.com"):
         text = extract_argaam_article_text(page)
@@ -789,9 +896,10 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
     host = urlparse(url).netloc.lower()
     if host.startswith("www."):
         host = host[4:]
-    is_argaam = host == "argaam.com" or host.endswith(".argaam.com")
+    skip_cache_domains = {"argaam.com", "sabq.org", "maaal.com", "spa.gov.sa"}
+    skip_cache = any(host == domain or host.endswith(f".{domain}") for domain in skip_cache_domains)
 
-    cached = None if is_argaam else get_cached_result(cache or {}, [url])
+    cached = None if skip_cache else get_cached_result(cache or {}, [url])
     if cached:
         cached["rss_score"] = int(news_item.get("rss_score", cached.get("rss_score", 0)))
         cached["score"] = cached["rss_score"]
@@ -806,7 +914,7 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
     if url and page:
         full_text, original_image_url, final_url, stale_article = scrape_full_article(page, url)
     elif url:
-        final_url = resolve_final_url_via_requests(url)
+        final_url = resolve_final_url(url)
 
     if final_url and not is_allowed_domain(final_url):
         logger.warning(f"Skipping non-approved source after resolution: {final_url}")
@@ -816,16 +924,20 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
         logger.info(f"Skipping stale article entirely: {final_url or url}")
         return None
 
+    if not final_url:
+        logger.warning(f"Skipping article because final URL resolution failed: {url}")
+        return None
+
     content_to_use = full_text if len(full_text) >= MIN_CONTENT_LENGTH else ""
     if not content_to_use:
-        content_to_use = clean_extracted_text(news_item.get("description", ""))
-        logger.warning("Full article extraction was low quality. Falling back to RSS summary.")
+        logger.warning(f"Skipping article because extracted page content was insufficient: {final_url}")
+        return None
 
     if not content_to_use:
         logger.warning(f"No usable content found for '{news_item.get('title', '')[:60]}'.")
         return None
 
-    if is_argaam:
+    if host == "argaam.com" or host.endswith(".argaam.com"):
         preview = content_to_use[:300].replace("\n", " ")
         logger.info(f"Argaam extracted preview: {preview}")
 

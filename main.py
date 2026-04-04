@@ -2,7 +2,7 @@ import argparse
 import webbrowser
 import os
 from utils import setup_logger
-from news_fetcher import fetch_rss_news
+from news_fetcher import fetch_valid_news
 from llm_processor import process_all_news
 from html_generator import generate_report
 from playwright.sync_api import sync_playwright
@@ -68,7 +68,7 @@ def main():
 
     # 1. Fetch
     logger.info("=== STEP 1: Fetching News ===")
-    raw_news = fetch_rss_news(limit=10)
+    raw_news = fetch_valid_news(target=10)
     
     if not raw_news:
         logger.error("No news fetched. Exiting.")

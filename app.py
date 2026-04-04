@@ -6,7 +6,7 @@ import streamlit as st
 
 from html_generator import get_news_image_url, generate_report
 from llm_processor import process_all_news
-from news_fetcher import fetch_rss_news
+from news_fetcher import fetch_valid_news
 
 CARD_COLUMNS = 3
 RAW_NEWS_LIMIT = 20
@@ -180,7 +180,7 @@ st.markdown(
 
 def load_news() -> list:
     with st.spinner("Fetching, filtering, and ranking news from approved domains..."):
-        return fetch_rss_news(limit=RAW_NEWS_LIMIT, days_back=RAW_NEWS_DAYS_BACK)
+        return fetch_valid_news(target=RAW_NEWS_LIMIT, days_back=RAW_NEWS_DAYS_BACK)
 
 
 def reset_selection_flags(total_items: int, value: bool) -> None:
