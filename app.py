@@ -8,174 +8,308 @@ from html_generator import get_news_image_url, generate_report
 from llm_processor import process_all_news
 from news_fetcher import fetch_valid_news
 
-CARD_COLUMNS = 3
-RAW_NEWS_LIMIT = 20
+CARD_COLUMNS = 5
+RAW_NEWS_LIMIT = 35
 RAW_NEWS_DAYS_BACK = 7
 
 st.set_page_config(page_title="AI Financial News", layout="wide", page_icon="\U0001f4f0")
 
 st.markdown(
     """
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        * { font-family: 'Cairo', 'Inter', sans-serif; }
+
         .stApp {
-            background: linear-gradient(180deg, #f4f8fb 0%, #edf5fb 100%);
+            background: #0b1220;
         }
+
+        /* â”€â”€ Hero â”€â”€ */
         .hero-shell {
-            background: linear-gradient(135deg, #0f5c7a 0%, #159d9a 100%);
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(135deg, #0d1f3c 0%, #0f3d5c 45%, #0a7a78 100%);
             color: white;
-            padding: 1.4rem 1.6rem;
-            border-radius: 24px;
-            margin-bottom: 1.25rem;
-            box-shadow: 0 18px 50px rgba(15, 92, 122, 0.18);
+            padding: 2.2rem 2rem 2rem 2rem;
+            border-radius: 28px;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 24px 64px rgba(10, 122, 120, 0.35), 0 0 0 1px rgba(255,255,255,0.06);
         }
+        .hero-shell::before {
+            content: '';
+            position: absolute;
+            top: -60px; right: -80px;
+            width: 320px; height: 320px;
+            background: radial-gradient(circle, rgba(14,165,166,0.25) 0%, transparent 70%);
+            animation: pulse-orb 4s ease-in-out infinite alternate;
+        }
+        .hero-shell::after {
+            content: '';
+            position: absolute;
+            bottom: -40px; left: -60px;
+            width: 240px; height: 240px;
+            background: radial-gradient(circle, rgba(99,102,241,0.18) 0%, transparent 70%);
+            animation: pulse-orb 5s ease-in-out infinite alternate-reverse;
+        }
+        @keyframes pulse-orb {
+            from { transform: scale(1); opacity: 0.6; }
+            to   { transform: scale(1.15); opacity: 1; }
+        }
+        .hero-inner { position: relative; z-index: 2; }
+        .hero-badge {
+            display: inline-flex; align-items: center; gap: 0.4rem;
+            background: rgba(14,165,166,0.2);
+            border: 1px solid rgba(14,165,166,0.4);
+            color: #5eead4;
+            padding: 0.3rem 0.9rem;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 0.8rem;
+        }
+        .hero-badge::before { content: '\25CF'; font-size: 0.6rem; animation: blink 1.4s step-end infinite; }
+        @keyframes blink { 50% { opacity: 0; } }
         .hero-shell h1 {
-            margin: 0 0 0.4rem 0;
-            font-size: 2rem;
+            margin: 0 0 0.5rem 0;
+            font-size: 2.4rem;
+            font-weight: 900;
+            background: linear-gradient(90deg, #ffffff 0%, #a5f3eb 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
         .hero-shell p {
             margin: 0;
-            opacity: 0.92;
+            opacity: 0.82;
             font-size: 1rem;
+            font-weight: 400;
+            line-height: 1.7;
+            max-width: 600px;
         }
+        .hero-stats {
+            display: flex;
+            gap: 2rem;
+            margin-top: 1.4rem;
+        }
+        .hero-stat {
+            display: flex; flex-direction: column;
+            border-left: 2px solid rgba(94,234,212,0.3);
+            padding-left: 1rem;
+        }
+        .hero-stat-val {
+            font-size: 1.6rem;
+            font-weight: 900;
+            color: #5eead4;
+            line-height: 1;
+        }
+        .hero-stat-lbl {
+            font-size: 0.75rem;
+            color: rgba(255,255,255,0.6);
+            margin-top: 0.2rem;
+        }
+
+        /* --- Controls Bar --- */
+        div.stButton > button {
+            border-radius: 14px !important;
+            font-family: 'Cairo', sans-serif !important;
+            font-weight: 700 !important;
+            transition: all .2s ease !important;
+        }
+        div.stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(14,165,166,0.25) !important;
+        }
+
+        /* --- Section Shell --- */
+        .section-shell {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.09);
+            border-radius: 20px;
+            padding: 1rem 1.3rem;
+            margin-bottom: 1.2rem;
+            backdrop-filter: blur(12px);
+        }
+        .section-shell h3 {
+            color: #e2f0ff;
+            font-size: 1.05rem;
+            margin: 0 0 0.3rem 0;
+        }
+        .section-shell p {
+            color: #8fafc8;
+            margin: 0;
+            font-size: 0.9rem;
+        }
+
+        /* --- News Card --- */
         .card-shell {
-            background: #ffffff;
-            border: 1px solid #d9e8f3;
-            border-radius: 22px;
+            background: rgba(16, 28, 50, 0.85);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 20px;
             overflow: hidden;
-            box-shadow: 0 12px 28px rgba(23, 61, 89, 0.08);
-            margin-bottom: 0.85rem;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+            margin-bottom: 1rem;
+            transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
+        }
+        .card-shell:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 48px rgba(14,165,166,0.22);
+            border-color: rgba(14,165,166,0.4);
         }
         .card-shell.high-score {
-            border: 2px solid #0ea5a6;
-            box-shadow: 0 18px 36px rgba(14, 165, 166, 0.16);
+            border: 1.5px solid rgba(14,165,166,0.55);
+            box-shadow: 0 12px 40px rgba(14,165,166,0.2);
+        }
+        .card-shell.high-score:hover {
+            box-shadow: 0 24px 56px rgba(14,165,166,0.35);
+        }
+        .card-img-wrap {
+            position: relative;
+            width: 100%;
+            height: 150px;
+            overflow: hidden;
+            background: #0d1b2e;
+        }
+        .card-img-wrap::after {
+            content: '';
+            position: absolute;
+            bottom: 0; left: 0; right: 0;
+            height: 50%;
+            background: linear-gradient(transparent, rgba(10,18,36,0.9));
+            pointer-events: none;
         }
         .card-shell img {
             width: 100%;
-            height: 180px;
+            height: 150px;
             object-fit: cover;
             display: block;
-            background: #eef4f8;
+            transition: transform .35s ease;
         }
+        .card-shell:hover img { transform: scale(1.05); }
         .card-content {
-            padding: 1rem 1rem 0.4rem 1rem;
-        }
-        .card-title {
-            color: #12344d;
-            font-size: 1rem;
-            font-weight: 700;
-            line-height: 1.5;
-            margin-bottom: 0.6rem;
-            min-height: 3rem;
+            padding: 0.85rem 0.9rem 0.6rem 0.9rem;
         }
         .card-meta {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 0.5rem;
-            color: #5c7388;
-            font-size: 0.83rem;
-            margin-bottom: 0.7rem;
+            gap: 0.4rem;
+            color: #6b8399;
+            font-size: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+        .card-source {
+            display: inline-flex; align-items: center; gap: 0.3rem;
+            background: rgba(99,102,241,0.12);
+            color: #a5b4fc;
+            padding: 0.18rem 0.55rem;
+            border-radius: 6px;
+            font-size: 0.72rem;
+            font-weight: 700;
         }
         .score-badge {
             display: inline-block;
-            background: #e7f8f6;
-            color: #0b7f80;
-            padding: 0.25rem 0.65rem;
-            border-radius: 999px;
+            background: rgba(14,165,166,0.15);
+            color: #5eead4;
+            padding: 0.18rem 0.5rem;
+            border-radius: 6px;
             font-weight: 700;
+            font-size: 0.72rem;
+        }
+        .card-title {
+            color: #e8f0fb;
+            font-size: 0.88rem;
+            font-weight: 700;
+            line-height: 1.55;
+            margin-bottom: 0.45rem;
+            min-height: 2.7rem;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
         }
         .card-desc {
-            color: #496173;
-            font-size: 0.9rem;
+            color: #6b8399;
+            font-size: 0.78rem;
             line-height: 1.55;
-            min-height: 4.8rem;
-            margin-bottom: 0.9rem;
-        }
-        .selection-bar {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid #d9e8f3;
-            border-radius: 18px;
-            padding: 0.9rem 1rem;
-            margin-bottom: 1rem;
-        }
-        .section-shell {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid #d9e8f3;
-            border-radius: 20px;
-            padding: 1rem 1.1rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 12px 24px rgba(23, 61, 89, 0.05);
-        }
-        .section-shell h3 {
-            color: #12344d;
-            font-size: 1.05rem;
-            margin: 0 0 0.35rem 0;
-        }
-        .section-shell p {
-            color: #5c7388;
-            margin: 0;
-            font-size: 0.92rem;
+            margin-bottom: 0.7rem;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
         }
         .card-link {
-            display: inline-block;
-            margin-top: 0.2rem;
-            color: #0f5c7a;
-            font-size: 0.9rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            color: #38bdf8;
+            font-size: 0.78rem;
             font-weight: 700;
             text-decoration: none;
+            transition: color .18s;
         }
-        .card-link:hover {
-            color: #0ea5a6;
-            text-decoration: underline;
-        }
+        .card-link:hover { color: #5eead4; }
+        .card-link::after { content: '\2192'; }
+
+        /* --- Review Page --- */
         .review-head {
-            background: linear-gradient(135deg, #ffffff 0%, #f6fbff 100%);
-            border: 1px solid #d9e8f3;
-            border-radius: 18px;
-            padding: 0.95rem 1rem;
-            margin-bottom: 0.85rem;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.09);
+            border-radius: 16px;
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.8rem;
         }
         .review-head h4 {
-            color: #12344d;
-            font-size: 1rem;
-            line-height: 1.6;
-            margin: 0 0 0.4rem 0;
+            color: #e2f0ff;
+            font-size: 0.95rem;
+            line-height: 1.65;
+            margin: 0 0 0.35rem 0;
         }
         .review-head p {
-            color: #5c7388;
-            font-size: 0.84rem;
+            color: #6b8399;
+            font-size: 0.8rem;
             margin: 0;
         }
         .review-link {
             display: inline-block;
-            margin-top: 0.65rem;
-            background: #eef7fb;
-            color: #0f5c7a;
-            border: 1px solid #d7e4ef;
+            margin-top: 0.6rem;
+            background: rgba(56,189,248,0.1);
+            color: #38bdf8;
+            border: 1px solid rgba(56,189,248,0.25);
             border-radius: 999px;
-            padding: 0.45rem 0.85rem;
+            padding: 0.4rem 0.9rem;
             text-decoration: none;
-            font-size: 0.88rem;
+            font-size: 0.84rem;
             font-weight: 700;
+            transition: all .18s;
         }
         .review-link:hover {
-            background: #e3f4f2;
-            color: #0b7f80;
+            background: rgba(56,189,248,0.18);
+            color: #7dd3fc;
         }
+
+        /* â”€â”€ Streamlit overrides â”€â”€ */
+        .stMetric label { color: #8fafc8 !important; font-family: 'Cairo', sans-serif !important; }
+        .stMetric [data-testid="metric-container"] { background: rgba(255,255,255,0.04); border-radius: 14px; padding: 0.6rem 1rem; border: 1px solid rgba(255,255,255,0.07); }
+        div[data-testid="stCheckbox"] label { color: #8fafc8 !important; font-family: 'Cairo', sans-serif !important; }
+        .stTextInput input, .stTextArea textarea {
+            background: rgba(255,255,255,0.05) !important;
+            border-color: rgba(255,255,255,0.1) !important;
+            color: #e2f0ff !important;
+            border-radius: 12px !important;
+            font-family: 'Cairo', sans-serif !important;
+        }
+        .stRadio label { color: #8fafc8 !important; }
+        div[data-testid="stExpander"] { border-color: rgba(255,255,255,0.09) !important; border-radius: 14px !important; }
+        .stWarning, .stSuccess, .stError, .stInfo { border-radius: 12px !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="hero-shell">
-        <h1>AI Financial News Hub</h1>
-        <p>Review high-priority Saudi financial news, select the strongest items, and generate a polished report draft.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# Hero is rendered after we know how many items to show
+_hero_placeholder = st.empty()
 
 
 def load_news() -> list:
@@ -214,7 +348,11 @@ if st.session_state.get("raw_news_days_back") != RAW_NEWS_DAYS_BACK:
 if "processed_news" not in st.session_state:
     st.session_state.processed_news = None
 
-raw_news = st.session_state.raw_news
+raw_news = sorted(
+    st.session_state.raw_news,
+    key=lambda x: x.get("rss_score", x.get("score", 0)),
+    reverse=True,
+)
 for idx in range(len(raw_news)):
     st.session_state.setdefault(f"chk_{idx}", False)
 
@@ -223,26 +361,45 @@ if st.session_state.processed_news is None:
 
     control_a, control_b, control_c, control_d = st.columns([1, 1, 1, 1.2])
     with control_a:
-        if st.button("Select All", use_container_width=True) and raw_news:
+        if st.button("Select All", width='stretch') and raw_news:
             reset_selection_flags(len(raw_news), True)
             st.rerun()
     with control_b:
-        if st.button("Clear Selection", use_container_width=True) and raw_news:
+        if st.button("Clear Selection", width='stretch') and raw_news:
             reset_selection_flags(len(raw_news), False)
             st.rerun()
     with control_c:
-        if st.button("Refresh Feed", use_container_width=True):
+        if st.button("Refresh Feed", width='stretch'):
             st.session_state.raw_news = load_news()
             st.session_state.processed_news = None
             st.rerun()
     with control_d:
         st.metric("Selected News", selected_count)
 
+    total_news = len(raw_news)
+    _hero_placeholder.markdown(
+        f"""
+        <div class="hero-shell">
+          <div class="hero-inner">
+            <div class="hero-badge">LIVE</div>
+            <h1>AI Financial News Hub</h1>
+            <p>استعرض أبرز الأخبار المالية السعودية عالية الأولوية، اختر المناسب منها وأنشئ تقريراً احترافياً بضغطة زر.</p>
+            <div class="hero-stats">
+              <div class="hero-stat"><span class="hero-stat-val">{total_news}</span><span class="hero-stat-lbl">خبر متاح</span></div>
+              <div class="hero-stat"><span class="hero-stat-val" id="sel-count-hero">{selected_count}</span><span class="hero-stat-lbl">تم تحديده</span></div>
+              <div class="hero-stat"><span class="hero-stat-val">{RAW_NEWS_DAYS_BACK}</span><span class="hero-stat-lbl">أيام للخلف</span></div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown(
         """
         <div class="section-shell">
-            <h3>مرحلة اختيار الأخبار</h3>
-            <p>اختر الأخبار الأنسب من البطاقات التالية. يمكنك زيارة المصدر الأصلي مباشرة قبل التحديد.</p>
+            <h3>📁 مرحلة اختيار الأخبار</h3>
+            <p>اختر الأخبار الأنسب من البطاقات أدناه. يمكنك زيارة الخبر الأصلي قبل التحديد. النهائي يُرتَّب تلقائياً وفق الأهمية.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -252,7 +409,7 @@ if st.session_state.processed_news is None:
         st.warning("No news retrieved. Check network connectivity or approved source coverage.")
     else:
         for start in range(0, len(raw_news), CARD_COLUMNS):
-            columns = st.columns(CARD_COLUMNS)
+            columns = st.columns(CARD_COLUMNS, gap="small")
             for offset in range(CARD_COLUMNS):
                 idx = start + offset
                 if idx >= len(raw_news):
@@ -261,36 +418,39 @@ if st.session_state.processed_news is None:
                 item = raw_news[idx]
                 title = html.escape(str(item.get("title", "")))
                 source = html.escape(str(item.get("source", "")))
-                description = html.escape(str(item.get("description", ""))[:180])
+                description = html.escape(str(item.get("description", ""))[:120])
                 score = item.get("rss_score", item.get("score", 0))
                 published_date = format_card_date(item.get("published", ""))
                 image_url = get_news_image_url(item, prefer_original=True)
                 card_class = "card-shell high-score" if score >= 100 else "card-shell"
+                card_num = idx + 1
 
                 with columns[offset]:
                     st.markdown(
                         f"""
                         <div class="{card_class}">
-                            <img src="{html.escape(image_url)}" alt="" />
+                            <div class="card-img-wrap">
+                                <img src="{html.escape(image_url)}" alt="" />
+                            </div>
                             <div class="card-content">
                                 <div class="card-meta">
-                                    <span>{source}</span>
-                                    <span class="score-badge">RSS {score}</span>
+                                    <span class="card-source">#{card_num} {source}</span>
+                                    <span class="score-badge">{score}</span>
                                 </div>
-                                <div class="card-meta"><span>التاريخ: {html.escape(published_date)}</span></div>
+                                <div class="card-meta"><span>📅 {html.escape(published_date)}</span></div>
                                 <div class="card-title">{title}</div>
-                                <div class="card-desc">{description}...</div>
-                                <a class="card-link" href="{html.escape(item.get('link', '#'))}" target="_blank" rel="noopener noreferrer">زيارة الخبر الأصلي</a>
+                                <div class="card-desc">{description}…</div>
+                                <a class="card-link" href="{html.escape(item.get('link', '#'))}" target="_blank" rel="noopener noreferrer">قراءة الخبر</a>
                             </div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                    st.checkbox("Select", key=f"chk_{idx}")
+                    st.checkbox("✓ اختر", key=f"chk_{idx}")
 
     selected_news = [item for idx, item in enumerate(raw_news) if st.session_state.get(f"chk_{idx}", False)]
 
-    if st.button("Generate Report", type="primary", use_container_width=True):
+    if st.button("Generate Report", type="primary", width='stretch'):
         if not selected_news:
             st.error("Select at least one article before generating the report.")
         else:
@@ -316,7 +476,7 @@ else:
 
     top_controls = st.columns([1, 1, 1.5])
     with top_controls[0]:
-        if st.button("Back to Selection", use_container_width=True):
+        if st.button("Back to Selection", width='stretch'):
             st.session_state.processed_news = None
             st.rerun()
     with top_controls[1]:
@@ -371,7 +531,7 @@ else:
                         st.warning("Unverified fallback values were used. Review carefully.")
 
                     preview_image = get_news_image_url(item, prefer_original=True)
-                    st.image(preview_image, use_container_width=True)
+                    st.image(preview_image, width='stretch')
 
                     remove_toggle = st.checkbox(f"Remove News {idx + 1}", key=f"rm_{idx}")
                     title_val = st.text_input("Title", value=item.get("title", ""), key=f"title_{idx}")
@@ -404,7 +564,7 @@ else:
 
                     if not use_original:
                         image_keyword = st.text_input("Image Keyword", value=image_keyword, key=f"imgkw_{idx}")
-                        st.image(get_news_image_url({"image_keyword": image_keyword, "title": title_val}), use_container_width=True)
+                        st.image(get_news_image_url({"image_keyword": image_keyword, "title": title_val}), width='stretch')
 
                     with st.expander("View Extracted Article Text"):
                         st.text(item.get("original_text", "No extracted text available."))
@@ -430,7 +590,7 @@ else:
 
     st.markdown("---")
 
-    if st.button("Finalize and Export", type="primary", use_container_width=True):
+    if st.button("Finalize and Export", type="primary", width='stretch'):
         if not edited_news_pool:
             st.error("Keep at least one article before export.")
         else:
@@ -482,11 +642,11 @@ else:
             download_cols = st.columns(3)
             with download_cols[0]:
                 with open(html_path, "rb") as handle:
-                    st.download_button("Download HTML", handle, file_name="report.html", use_container_width=True)
+                    st.download_button("Download HTML", handle, file_name="report.html", width='stretch')
             with download_cols[1]:
                 if pdf_success and os.path.exists(pdf_path):
                     with open(pdf_path, "rb") as handle:
-                        st.download_button("Download PDF", handle, file_name="report.pdf", use_container_width=True)
+                        st.download_button("Download PDF", handle, file_name="report.pdf", width='stretch')
             with download_cols[2]:
                 if img_success and os.path.exists(img_path):
                     with open(img_path, "rb") as handle:
@@ -495,5 +655,5 @@ else:
                             handle,
                             file_name="report.jpg",
                             mime="image/jpeg",
-                            use_container_width=True,
+                            width='stretch',
                         )

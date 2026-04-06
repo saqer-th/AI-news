@@ -762,20 +762,16 @@ def scrape_full_article(page, url: str) -> tuple[str, str, str, bool]:
     if host.startswith("www."):
         host = host[4:]
 
+    # Extract date for metadata only — never reject based on page-extracted date.
+    # Freshness filtering already happened at the RSS level in news_fetcher.py.
     if host == "sabq.org" or host.endswith(".sabq.org"):
         article_date = extract_sabq_date(page)
         if article_date is None:
-            logger.warning(f"Skipping Sabq article because date extraction failed: {final_url}")
-            return "", "", final_url, True
+            logger.info(f"Sabq date not found for {final_url} — proceeding anyway.")
     else:
         article_date = get_article_date_from_page(page)
-
-    if not is_recent_article_date(article_date):
-        if host == "sabq.org" or host.endswith(".sabq.org"):
-            logger.info(f"Skipping stale Sabq article based on page date {article_date.date() if article_date else 'unknown'}: {final_url}")
-        else:
-            logger.info(f"Skipping stale article based on page date {article_date.date() if article_date else 'unknown'}: {final_url}")
-        return "", "", final_url, True
+        if article_date is None:
+            logger.info(f"Page date not found for {final_url} — proceeding anyway.")
 
     selectors = get_domain_selectors(final_url)
 
@@ -789,6 +785,7 @@ def scrape_full_article(page, url: str) -> tuple[str, str, str, bool]:
     text = postprocess_domain_text(final_url, text)
     image_url = get_original_image_url(page)
     scrape_full_article.last_article_date = article_date
+    # Always return stale=False — rejection by page date was removed intentionally.
     return text, image_url, final_url, False
 
 
@@ -909,19 +906,14 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
     full_text = ""
     original_image_url = ""
     final_url = url
-    stale_article = False
 
     if url and page:
-        full_text, original_image_url, final_url, stale_article = scrape_full_article(page, url)
+        full_text, original_image_url, final_url, _ = scrape_full_article(page, url)
     elif url:
         final_url = resolve_final_url(url)
 
     if final_url and not is_allowed_domain(final_url):
         logger.warning(f"Skipping non-approved source after resolution: {final_url}")
-        return None
-
-    if stale_article:
-        logger.info(f"Skipping stale article entirely: {final_url or url}")
         return None
 
     if not final_url:

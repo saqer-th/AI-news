@@ -1,7 +1,9 @@
 import contextlib
 import feedparser
+import glob
 import html
 import io
+import os
 import random
 import re
 import time
@@ -57,11 +59,22 @@ ALLOWED_DOMAINS = [
     "spa.gov.sa",
 ]
 
+# Query targets Saudi-specific financial news by combining topic terms with
+# mandatory Saudi geographic/institutional context anchors.
+# The AND clause dramatically reduces off-topic international results.
 BASE_ARABIC_FINANCE_QUERY = (
-    "(\u0627\u0642\u062a\u0635\u0627\u062f OR "
-    "\u062a\u0627\u0633\u064a OR "
-    "\u0623\u0639\u0645\u0627\u0644 OR "
-    "\u0645\u0627\u0644\u064a\u0629)"
+    "("
+    "\u0627\u0642\u062a\u0635\u0627\u062f OR "     # اقتصاد
+    "\u0645\u0627\u0644\u064a\u0629 OR "           # مالية
+    "\u0623\u0639\u0645\u0627\u0644 OR "           # أعمال
+    "\u0627\u0633\u062a\u062b\u0645\u0627\u0631 OR "# استثمار
+    "\u0628\u0646\u0648\u0643 OR "                # بنوك
+    "\u062a\u0627\u0633\u064a"                    # تاسي
+    ") AND ("
+    "\u0627\u0644\u0633\u0639\u0648\u062f\u064a\u0629 OR "  # السعودية
+    "\u0633\u0639\u0648\u062f\u064a OR "                   # سعودي
+    "\u0627\u0644\u0645\u0645\u0644\u0643\u0629"           # المملكة
+    ")"
 )
 
 
@@ -157,6 +170,31 @@ def normalize_domain(url: str) -> str:
     return host
 
 
+def _cleanup_stale_chromedriver(force: bool = False) -> None:
+    """Delete stale chromedriver.exe files left by crashed sessions.
+
+    On Windows, undetected_chromedriver renames the downloaded chromedriver.exe
+    to a temp name before patching it.  If a previous session crashed mid-rename
+    the file already exists and the next rename raises WinError 183.  We delete
+    it proactively so uc can proceed cleanly.
+    """
+    uc_dir = os.path.join(os.path.expanduser("~"), "appdata", "roaming", "undetected_chromedriver")
+    patterns = [
+        os.path.join(uc_dir, "**", "chromedriver.exe"),
+        os.path.join(uc_dir, "undetected_chromedriver.exe"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                os.remove(path)
+                logger.debug(f"Removed stale chromedriver file: {path}")
+            except PermissionError:
+                if force:
+                    logger.warning(f"Could not remove locked chromedriver file: {path}")
+            except FileNotFoundError:
+                pass
+
+
 def get_driver():
     global _driver
 
@@ -164,12 +202,26 @@ def get_driver():
         if uc is None:
             raise RuntimeError("undetected_chromedriver is unavailable")
 
+        _cleanup_stale_chromedriver()
+
         options = uc.ChromeOptions()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            _driver = uc.Chrome(options=options)
+            # Pin to the major version of the installed Chrome browser.
+            # If Chrome updates, bump this number to match.
+            try:
+                _driver = uc.Chrome(options=options, version_main=146)
+            except Exception as exc:
+                # WinError 183 can still race on first try — clean up and retry once
+                if "183" in str(exc) or "already exists" in str(exc).lower():
+                    logger.warning(f"ChromeDriver init race error, retrying after cleanup: {exc}")
+                    _cleanup_stale_chromedriver(force=True)
+                    time.sleep(1)
+                    _driver = uc.Chrome(options=options, version_main=146)
+                else:
+                    raise
 
     return _driver
 
@@ -640,6 +692,37 @@ def is_allowed_domain(url: str) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in ALLOWED_DOMAINS)
 
 
+# Strong Saudi geographic/institutional indicators used by is_saudi_news()
+# and for boosting the relevance score.
+SAUDI_KEYWORDS = [
+    "السعودية",
+    "المملكة",
+    "الرياض",
+    "جدة",
+    "ساما",
+    "تاسي",
+    "وزارة المالية",
+    "البنك المركزي",
+    "مكة",
+    "الدمام",
+    "سعودي",
+    "سعودية",
+    "صندوق الاستثمارات العامة",
+    "رؤية 2030",
+]
+
+
+def is_saudi_news(title: str, description: str) -> bool:
+    """Return True only if the article contains at least one strong Saudi indicator.
+
+    This acts as a hard gate after domain filtering to ensure we never collect
+    financial news that happens to come from an allowed domain but covers a
+    non-Saudi subject (e.g. global markets, other countries).
+    """
+    text = f"{title} {description}"
+    return any(kw in text for kw in SAUDI_KEYWORDS)
+
+
 def detect_business_bucket(title: str, description: str) -> str:
     text = f"{title} {description}".lower()
     if any(keyword in text for keyword in SIMAH_KEYWORDS):
@@ -654,16 +737,27 @@ def detect_business_bucket(title: str, description: str) -> str:
 
 
 def score_news(title: str, description: str) -> int:
-    text = f"{title} {description}".lower()
+    """Score an article by topic relevance, with Saudi context weighted highest."""
+    text = f"{title} {description}"
+    text_lower = text.lower()
     score = 0
 
-    if any(keyword in text for keyword in SIMAH_KEYWORDS):
-        score += 100
-    if any(keyword in text for keyword in SAMA_KEYWORDS):
-        score += 80
-    if any(keyword in text for keyword in FINANCIAL_KEYWORDS):
+    # --- Saudi geographic / institutional weighting (highest priority) ---
+    if "السعودية" in text or "المملكة" in text:
+        score += 60
+    if "ساما" in text:
         score += 50
-    if any(keyword in text for keyword in ECONOMY_KEYWORDS):
+    if "تاسي" in text:
+        score += 40
+
+    # --- Existing topic-based scoring ---
+    if any(keyword in text_lower for keyword in SIMAH_KEYWORDS):
+        score += 100
+    if any(keyword in text_lower for keyword in SAMA_KEYWORDS):
+        score += 80
+    if any(keyword in text_lower for keyword in FINANCIAL_KEYWORDS):
+        score += 50
+    if any(keyword in text_lower for keyword in ECONOMY_KEYWORDS):
         score += 30
 
     return score
@@ -745,13 +839,13 @@ def validate_article(item: dict, days_back: int = 7) -> tuple[bool, str]:
 
 
 
-def fetch_valid_news(target: int = 25, max_batches: int = 6, days_back: int = 7) -> list:
+def fetch_valid_news(target: int = 35, max_batches: int = 6, days_back: int = 7) -> list:
     collected = []
     seen_titles = set()
     seen_links = set()
     try:
         for attempt in range(1, max_batches + 1):
-            batch = fetch_rss_news(limit=50, days_back=days_back)
+            batch = fetch_rss_news(limit=70, days_back=days_back)
             # avoid same ordering each run
             random.shuffle(batch)
             if not batch:
@@ -783,18 +877,39 @@ def fetch_valid_news(target: int = 25, max_batches: int = 6, days_back: int = 7)
         close_driver()
 
 
-def fetch_rss_news(limit: int = 25, days_back: int = 7) -> list:
+def fetch_rss_news(limit: int = 35, days_back: int = 7) -> list:
     logger.info("Aggregating news from curated financial sources...")
     all_news = []
     rss_sources = build_rss_sources(days_back=days_back)
 
+    _RSS_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
+    }
+
     for url in rss_sources:
         try:
-            feed = feedparser.parse(url)
+            # Pre-fetch with real browser headers so Google News returns valid XML
+            # instead of an HTML error/captcha page.
+            try:
+                rss_resp = requests.get(url, headers=_RSS_HEADERS, timeout=15)
+                feed = feedparser.parse(rss_resp.content)
+            except Exception as fetch_exc:
+                logger.warning(f"HTTP fetch failed for {url}: {fetch_exc} — falling back to feedparser direct")
+                feed = feedparser.parse(url)
+
             if feed.bozo and feed.bozo_exception:
+                if not feed.entries:
+                    logger.warning(f"Skipping broken feed (no entries) for {url}: {feed.bozo_exception}")
+                    continue
                 logger.warning(f"Feed parser warning for {url}: {feed.bozo_exception}")
 
-            for entry in feed.entries[:30]:
+            for entry in feed.entries[:40]:
                 title = clean_html(entry.get("title", "No Title"))
 
                 # Prefer the real publisher URL embedded in the RSS entry.
@@ -828,6 +943,12 @@ def fetch_rss_news(limit: int = 25, days_back: int = 7) -> list:
                         break
 
                 if not is_allowed:
+                    continue
+
+                # Hard Saudi-context gate: skip articles with no Saudi indicator
+                # regardless of domain or financial keywords.
+                if not is_saudi_news(title, description):
+                    logger.debug(f"Skipped (no Saudi context): {title[:60]}")
                     continue
 
                 if " / " in title:
@@ -868,5 +989,12 @@ def fetch_rss_news(limit: int = 25, days_back: int = 7) -> list:
             unique_news.append(item)
 
     final_selection = unique_news[:limit]
+
+    # Add a 1-based rank field ordered by score (highest score = rank 1).
+    # The list is already sorted by (business_priority, rss_score, date) desc,
+    # so rank simply reflects that ordering for display purposes.
+    for rank, item in enumerate(final_selection, start=1):
+        item["rank"] = rank
+
     logger.info(f"Successfully fetched {len(final_selection)} filtered and scored news items.")
     return final_selection
