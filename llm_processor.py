@@ -1,8 +1,10 @@
 import contextlib
+import html
 import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +19,16 @@ except ImportError:
 from playwright.sync_api import sync_playwright
 import time
 
-from news_fetcher import ALLOWED_DOMAINS, BUSINESS_PRIORITY, detect_business_bucket, is_allowed_domain
+from news_fetcher import (
+    ALLOWED_DOMAINS,
+    BUSINESS_PRIORITY,
+    detect_language as detect_news_language,
+    detect_business_bucket,
+    extract_page_date_requests_only,
+    is_allowed_domain,
+    resolve_final_url as shared_resolve_final_url,
+)
+from pipeline_utils import load_json_cache, request_with_retry, save_json_cache, stable_hash, utc_now_iso
 from utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -26,7 +37,13 @@ _url_cache: dict[str, str | None] = {}
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3:8b")
 CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "processed_news.json"
-EXTRACTION_CACHE_VERSION = "2026-04-04-sabq-maaal-spa-v4"
+ARTICLE_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "scraped_articles.json"
+EXTRACTION_CACHE_VERSION = "2026-04-12-language-aware-v1"
+PROCESSED_CACHE_TTL_SECONDS = 7 * 24 * 3600
+PROCESSED_CACHE_MAX_ENTRIES = 1500
+ARTICLE_CACHE_TTL_SECONDS = 36 * 3600
+ARTICLE_CACHE_MAX_ENTRIES = 800
+LLM_MAX_WORKERS = max(1, int(os.getenv("LLM_MAX_WORKERS", "2")))
 MIN_CONTENT_LENGTH = 300
 ARTICLE_MAX_AGE_DAYS = 7
 LLM_RETRY_LIMIT = 3
@@ -76,8 +93,9 @@ You MUST return EXACTLY this structure:
 }}
 
 RULES:
-- title, summary items, and category must be in Arabic.
-- summary must be an array of exactly 2 concise items in Arabic.
+- title and summary items must be in {output_language_name}.
+- {language_guard}
+- summary must be an array of exactly 2 concise items in {output_language_name}.
 - category must be one of: \u0627\u0642\u062a\u0635\u0627\u062f, \u062a\u0642\u0646\u064a\u0629, \u0633\u064a\u0627\u0633\u0629, \u0623\u0639\u0645\u0627\u0644, \u0639\u0627\u0645.
 - importance must be an integer from 1 to 10.
 - image_keyword must be English only and specific to the subject.
@@ -91,7 +109,7 @@ NEWS CONTENT:
 {content}
 """
 
-SUMMARIZE_3_LINES_PROMPT = """\u0623\u0646\u062a \u0645\u062d\u0631\u0631 \u0623\u062e\u0628\u0627\u0631 \u0645\u062d\u062a\u0631\u0641.
+SUMMARIZE_3_LINES_PROMPT_AR = """\u0623\u0646\u062a \u0645\u062d\u0631\u0631 \u0623\u062e\u0628\u0627\u0631 \u0645\u062d\u062a\u0631\u0641.
 
 \u0627\u0642\u0631\u0623 \u0627\u0644\u062e\u0628\u0631 \u0627\u0644\u062a\u0627\u0644\u064a \u0628\u0639\u0646\u0627\u064a\u0629\u060c \u062b\u0645 \u0627\u0643\u062a\u0628 \u0645\u0644\u062e\u0635\u064b\u0627 \u0648\u0627\u0636\u062d\u064b\u0627 \u0648\u0645\u062e\u062a\u0635\u0631\u064b\u0627 \u0645\u0646 3 \u0633\u0637\u0648\u0631 \u0641\u0642\u0637.
 
@@ -110,6 +128,83 @@ STRICT:
 
 \u0627\u0644\u062e\u0628\u0631:
 {NEWS_TEXT}"""
+
+SUMMARIZE_3_LINES_PROMPT_EN = """You are a professional news editor.
+
+Read the following article carefully, then write a clear summary in exactly 3 short lines.
+
+Rules:
+
+* Write in English only
+* Do not translate the summary into Arabic
+* Do not use bullets or numbering
+* Each line must be one short sentence
+* Line 1: what happened
+* Line 2: the key details
+* Line 3: why this matters
+* Do not add any text outside the summary
+
+STRICT:
+The output must be exactly 3 lines.
+
+NEWS:
+{NEWS_TEXT}"""
+
+SUMMARY_PROMPT_CACHE_VERSION = "summary-v2"
+STRUCTURED_PROMPT_CACHE_VERSION = "structured-v2"
+
+
+def normalize_content_language(value: str | None) -> str:
+    return "en" if str(value or "").strip().lower() == "en" else "ar"
+
+
+def detect_processing_language(news_item: dict, content_to_use: str = "") -> str:
+    explicit = str(news_item.get("language", "")).strip().lower()
+    if explicit in {"ar", "en"}:
+        return explicit
+
+    candidate_text = " ".join(
+        part
+        for part in (
+            str(news_item.get("title", "") or ""),
+            str(news_item.get("description", "") or ""),
+            str(content_to_use or "")[:1500],
+        )
+        if part
+    )
+    return normalize_content_language(detect_news_language(candidate_text))
+
+
+def _language_name(language: str) -> str:
+    return "English" if normalize_content_language(language) == "en" else "Arabic"
+
+
+def build_structured_prompt(news_item: dict, content_to_use: str, language: str) -> str:
+    normalized_language = normalize_content_language(language)
+    language_guard = (
+        "If the source article is in English, keep the title and summary in English and do not translate them into Arabic."
+        if normalized_language == "en"
+        else "If the source article is in Arabic, keep the title and summary in Arabic."
+    )
+    return PROMPT_TEMPLATE.format(
+        title=news_item.get("title", ""),
+        content=content_to_use,
+        output_language_name=_language_name(normalized_language),
+        language_guard=language_guard,
+    )
+
+
+def build_summary_prompt(news_text: str, language: str) -> str:
+    template = SUMMARIZE_3_LINES_PROMPT_EN if normalize_content_language(language) == "en" else SUMMARIZE_3_LINES_PROMPT_AR
+    return template.replace("{NEWS_TEXT}", news_text)
+
+
+def fallback_summary_line(language: str) -> str:
+    return (
+        "Insufficient article details were available."
+        if normalize_content_language(language) == "en"
+        else "\u0644\u0645 \u062a\u062a\u0648\u0641\u0631 \u062a\u0641\u0627\u0635\u064a\u0644 \u0643\u0627\u0641\u064a\u0629."
+    )
 
 DOMAIN_SELECTORS = {
     "argaam.com": [
@@ -341,22 +436,24 @@ def normalize_summary(value, fallback_text: str) -> list[str]:
     return normalized
 
 
-def clean_summary_lines(response_text: str) -> list[str]:
+def clean_summary_lines(response_text: str, language: str = "ar") -> list[str]:
     cleaned = clean_json_response(response_text)
+    normalized_language = normalize_content_language(language)
     lines = []
     for raw_line in cleaned.splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
         line = re.sub(r"^[\-\u2022\u25cf\d\.\)\(]+", "", line).strip()
         if not line:
             continue
-        if re.search(r"[A-Za-z]", line):
+        if normalized_language == "ar" and re.search(r"[A-Za-z]", line):
             line = re.sub(r"[A-Za-z]", "", line).strip()
         if line:
             lines.append(line)
     return lines
 
 
-def manual_fix_three_lines(lines: list[str], fallback_text: str) -> list[str]:
+def manual_fix_three_lines(lines: list[str], fallback_text: str, language: str = "ar") -> list[str]:
+    normalized_language = normalize_content_language(language)
     merged = lines[:]
     if len(merged) < 3:
         fallback_parts = [part.strip(" -\u2022") for part in SUMMARY_SPLIT_PATTERN.split(fallback_text) if part.strip()]
@@ -369,19 +466,20 @@ def manual_fix_three_lines(lines: list[str], fallback_text: str) -> list[str]:
         merged = merged[:2] + [" ".join(merged[2:]).strip()]
 
     while len(merged) < 3:
-        merged.append(merged[-1] if merged else "\u0644\u0645 \u062a\u062a\u0648\u0641\u0631 \u062a\u0641\u0627\u0635\u064a\u0644 \u0643\u0627\u0641\u064a\u0629.")
+        merged.append(merged[-1] if merged else fallback_summary_line(normalized_language))
 
     fixed_lines = []
     for line in merged[:3]:
-        cleaned = re.sub(r"[A-Za-z]", "", line)
+        cleaned = re.sub(r"[A-Za-z]", "", line) if normalized_language == "ar" else line
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        fixed_lines.append(cleaned[:220] if cleaned else "\u0644\u0645 \u062a\u062a\u0648\u0641\u0631 \u062a\u0641\u0627\u0635\u064a\u0644 \u0643\u0627\u0641\u064a\u0629.")
+        fixed_lines.append(cleaned[:220] if cleaned else fallback_summary_line(normalized_language))
     return fixed_lines
 
 
-def summarize_3_lines(news_text: str) -> list[str]:
+def summarize_3_lines(news_text: str, language: str | None = None) -> list[str]:
+    normalized_language = normalize_content_language(language)
     fallback_text = re.sub(r"\s+", " ", (news_text or "")).strip()
-    prompt = SUMMARIZE_3_LINES_PROMPT.replace("{NEWS_TEXT}", news_text)
+    prompt = build_summary_prompt(news_text, normalized_language)
     payload = {
         "model": "mistral",
         "prompt": prompt,
@@ -398,14 +496,14 @@ def summarize_3_lines(news_text: str) -> list[str]:
             response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=90)
             response.raise_for_status()
             raw_output = response.json().get("response", "")
-            lines = clean_summary_lines(raw_output)
+            lines = clean_summary_lines(raw_output, normalized_language)
             if len(lines) == 3:
                 return lines
             last_lines = lines
         except Exception as exc:
             logger.warning(f"3-line summary generation failed: {exc}")
 
-    return manual_fix_three_lines(last_lines, fallback_text)
+    return manual_fix_three_lines(last_lines, fallback_text, normalized_language)
 
 
 def fallback_summary_text(news_item: dict, content: str) -> str:
@@ -742,8 +840,13 @@ def extract_sabq_date(page) -> datetime | None:
     return None
 
 
-def scrape_full_article(page, url: str) -> tuple[str, str, str, bool]:
-    final_url = resolve_final_url(url)
+def scrape_full_article(
+    page,
+    url: str,
+    article_title: str | None = None,
+    source_hint: str | None = None,
+) -> tuple[str, str, str, bool]:
+    final_url = resolve_final_url(url, article_title=article_title, source_hint=source_hint)
     if not final_url or not is_allowed_domain(final_url):
         logger.warning(f"Rejected article after final URL resolution: {final_url or url}")
         return "", "", final_url, False
@@ -794,10 +897,19 @@ def parse_llm_json(raw_output: str) -> dict:
     return json.loads(cleaned)
 
 
-def normalize_llm_output(parsed_data: dict, news_item: dict, content_to_use: str, verified: bool) -> dict:
+def normalize_llm_output(
+    parsed_data: dict,
+    news_item: dict,
+    content_to_use: str,
+    verified: bool,
+    language: str | None = None,
+) -> dict:
+    normalized_language = detect_processing_language(news_item, content_to_use) if language is None else normalize_content_language(language)
     fallback_summary = fallback_summary_text(news_item, content_to_use)
     fallback_importance = default_importance_from_rss(int(news_item.get("rss_score", 0)))
     title = str(parsed_data.get("title", "")).strip() or news_item.get("title", "")
+    if normalized_language == "en" and re.search(r"[\u0600-\u06FF]", title) and re.search(r"[A-Za-z]", str(news_item.get("title", ""))):
+        title = str(news_item.get("title", "")).strip()
     summary = normalize_summary(parsed_data.get("summary", []), fallback_summary)
     category = normalize_category(parsed_data.get("category", FALLBACK_CATEGORY))
     importance = clamp_importance(parsed_data.get("importance", fallback_importance), fallback_importance)
@@ -818,14 +930,16 @@ def normalize_llm_output(parsed_data: dict, news_item: dict, content_to_use: str
         "score": rss_score,
         "business_bucket": bucket,
         "business_priority": priority,
+        "language": normalized_language,
         "verification_status": "verified" if verified else "unverified",
     }
     normalized["final_score"] = compute_final_score(normalized["rss_score"], normalized["importance"])
     return normalized
 
 
-def call_ollama_with_retries(news_item: dict, content_to_use: str) -> dict:
-    prompt = PROMPT_TEMPLATE.format(title=news_item.get("title", ""), content=content_to_use)
+def call_ollama_with_retries(news_item: dict, content_to_use: str, language: str | None = None) -> dict:
+    normalized_language = detect_processing_language(news_item, content_to_use) if language is None else normalize_content_language(language)
+    prompt = build_structured_prompt(news_item, content_to_use, normalized_language)
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
@@ -844,7 +958,7 @@ def call_ollama_with_retries(news_item: dict, content_to_use: str) -> dict:
             response.raise_for_status()
             raw_output = response.json().get("response", "")
             parsed = parse_llm_json(raw_output)
-            return normalize_llm_output(parsed, news_item, content_to_use, verified=True)
+            return normalize_llm_output(parsed, news_item, content_to_use, verified=True, language=normalized_language)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             last_error = exc
             logger.warning(f"Invalid JSON from Ollama for '{news_item.get('title', '')[:60]}', retry {attempt}/{LLM_RETRY_LIMIT}")
@@ -864,7 +978,7 @@ def call_ollama_with_retries(news_item: dict, content_to_use: str) -> dict:
         "importance": default_importance_from_rss(int(news_item.get("rss_score", 0))),
         "image_keyword": news_item.get("title", "Saudi financial news"),
     }
-    return normalize_llm_output(fallback_parsed, news_item, content_to_use, verified=False)
+    return normalize_llm_output(fallback_parsed, news_item, content_to_use, verified=False, language=normalized_language)
 
 
 def get_cached_result(cache: dict, url_candidates: list[str]) -> dict | None:
@@ -908,9 +1022,18 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
     final_url = url
 
     if url and page:
-        full_text, original_image_url, final_url, _ = scrape_full_article(page, url)
+        full_text, original_image_url, final_url, _ = scrape_full_article(
+            page,
+            url,
+            article_title=news_item.get("title", ""),
+            source_hint=news_item.get("source_domain") or news_item.get("source", ""),
+        )
     elif url:
-        final_url = resolve_final_url(url)
+        final_url = resolve_final_url(
+            url,
+            article_title=news_item.get("title", ""),
+            source_hint=news_item.get("source_domain") or news_item.get("source", ""),
+        )
 
     if final_url and not is_allowed_domain(final_url):
         logger.warning(f"Skipping non-approved source after resolution: {final_url}")
@@ -933,12 +1056,14 @@ def process_news_item(news_item: dict, page=None, cache: dict | None = None) -> 
         preview = content_to_use[:300].replace("\n", " ")
         logger.info(f"Argaam extracted preview: {preview}")
 
-    normalized = call_ollama_with_retries(news_item, content_to_use)
-    summary_lines = summarize_3_lines(content_to_use)
+    language = detect_processing_language(news_item, content_to_use)
+    normalized = call_ollama_with_retries(news_item, content_to_use, language=language)
+    summary_lines = summarize_3_lines(content_to_use, language=language)
     normalized["summary"] = summary_lines
     normalized["summary_3_lines"] = "\n".join(summary_lines)
     normalized["link"] = final_url or url
     normalized["canonical_url"] = final_url or url
+    normalized["language"] = language
     normalized["original_text"] = content_to_use
     normalized["original_image_url"] = original_image_url
     normalized["use_original_image"] = bool(original_image_url)
@@ -1001,3 +1126,639 @@ def process_all_news(news_items: list) -> list:
 
     save_cache(cache)
     return processed
+
+
+def _load_cache_optimized() -> dict:
+    return load_json_cache(CACHE_PATH)
+
+
+def _save_cache_optimized(cache: dict) -> None:
+    try:
+        save_json_cache(
+            CACHE_PATH,
+            cache,
+            max_entries=PROCESSED_CACHE_MAX_ENTRIES,
+            ttl_seconds=PROCESSED_CACHE_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to save cache: {exc}")
+
+
+def _load_article_cache() -> dict:
+    return load_json_cache(ARTICLE_CACHE_PATH)
+
+
+def _save_article_cache(article_cache: dict) -> None:
+    try:
+        save_json_cache(
+            ARTICLE_CACHE_PATH,
+            article_cache,
+            max_entries=ARTICLE_CACHE_MAX_ENTRIES,
+            ttl_seconds=ARTICLE_CACHE_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to save article cache: {exc}")
+
+
+def _strip_internal_fields(payload: dict) -> dict:
+    cleaned = deepcopy(payload)
+    cleaned.pop("cache_kind", None)
+    cleaned.pop("cached_at", None)
+    cleaned.pop("extraction_cache_version", None)
+    cleaned.pop("payload", None)
+    return cleaned
+
+
+def _parse_optional_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _structured_cache_key(content_hash: str) -> str:
+    return f"llm::{content_hash}"
+
+
+def _summary_cache_key(content_hash: str) -> str:
+    return f"summary::{content_hash}"
+
+
+def _build_structured_hash(news_item: dict, content_to_use: str, language: str) -> str:
+    return stable_hash(
+        "structured",
+        EXTRACTION_CACHE_VERSION,
+        STRUCTURED_PROMPT_CACHE_VERSION,
+        MODEL_NAME,
+        normalize_content_language(language),
+        news_item.get("title", ""),
+        content_to_use,
+    )
+
+
+def _build_summary_hash(content_to_use: str, language: str) -> str:
+    return stable_hash(
+        "summary-3-lines",
+        EXTRACTION_CACHE_VERSION,
+        SUMMARY_PROMPT_CACHE_VERSION,
+        normalize_content_language(language),
+        content_to_use,
+    )
+
+
+def _get_internal_cache(cache: dict, key: str, kind: str):
+    payload = cache.get(key)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_kind") != kind:
+        return None
+    if payload.get("extraction_cache_version") != EXTRACTION_CACHE_VERSION:
+        return None
+    return deepcopy(payload.get("payload"))
+
+
+def _set_internal_cache(cache: dict, key: str, kind: str, payload) -> None:
+    cache[key] = {
+        "cache_kind": kind,
+        "cached_at": utc_now_iso(),
+        "extraction_cache_version": EXTRACTION_CACHE_VERSION,
+        "payload": deepcopy(payload),
+    }
+
+
+def _get_cached_result_optimized(cache: dict, url_candidates: list[str]) -> dict | None:
+    for candidate in url_candidates:
+        key = build_cache_key(candidate)
+        if not key or key not in cache:
+            continue
+        payload = cache[key]
+        if not isinstance(payload, dict):
+            continue
+        cache_kind = payload.get("cache_kind")
+        if cache_kind not in {None, "processed_result"}:
+            continue
+        version = payload.get("extraction_cache_version")
+        if version not in {None, EXTRACTION_CACHE_VERSION}:
+            continue
+        return _strip_internal_fields(payload)
+    return None
+
+
+def _update_cache_optimized(cache: dict, result: dict, original_url: str, final_url: str) -> None:
+    payload = deepcopy(result)
+    payload["canonical_url"] = final_url or original_url
+    payload["extraction_cache_version"] = EXTRACTION_CACHE_VERSION
+    payload["cached_at"] = utc_now_iso()
+    payload["cache_kind"] = "processed_result"
+    for candidate in {build_cache_key(original_url), build_cache_key(final_url)}:
+        if candidate:
+            cache[candidate] = payload
+
+
+def _get_cached_article(article_cache: dict, url_candidates: list[str]) -> dict | None:
+    for candidate in url_candidates:
+        key = build_cache_key(candidate)
+        if not key or key not in article_cache:
+            continue
+        payload = article_cache[key]
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("cache_kind") != "scraped_article":
+            continue
+        if payload.get("extraction_cache_version") != EXTRACTION_CACHE_VERSION:
+            continue
+        return _strip_internal_fields(payload)
+    return None
+
+
+def _update_article_cache(article_cache: dict, article_payload: dict, original_url: str, final_url: str) -> None:
+    payload = deepcopy(article_payload)
+    payload["canonical_url"] = final_url or original_url
+    payload["extraction_cache_version"] = EXTRACTION_CACHE_VERSION
+    payload["cached_at"] = utc_now_iso()
+    payload["cache_kind"] = "scraped_article"
+    for candidate in {build_cache_key(original_url), build_cache_key(final_url)}:
+        if candidate:
+            article_cache[candidate] = payload
+
+
+def _summarize_3_lines_optimized(news_text: str, language: str | None = None) -> list[str]:
+    normalized_language = normalize_content_language(language)
+    fallback_text = re.sub(r"\s+", " ", (news_text or "")).strip()
+    prompt = build_summary_prompt(news_text, normalized_language)
+    payload = {
+        "model": "mistral",
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_ctx": 8192,
+            "temperature": 0.2,
+        },
+    }
+
+    last_lines = []
+    for attempt in range(1, 3):
+        try:
+            response = request_with_retry(
+                "POST",
+                "http://localhost:11434/api/generate",
+                session_name="ollama_summary",
+                json=payload,
+                timeout=90,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            raw_output = response.json().get("response", "")
+            lines = clean_summary_lines(raw_output, normalized_language)
+            if len(lines) == 3:
+                return lines
+            last_lines = lines
+        except Exception as exc:
+            logger.warning(f"3-line summary generation failed: {exc}")
+            time.sleep(min(2.0, 0.4 * attempt))
+
+    return manual_fix_three_lines(last_lines, fallback_text, normalized_language)
+
+
+def _call_ollama_with_retries_optimized(news_item: dict, content_to_use: str, language: str | None = None) -> dict:
+    normalized_language = detect_processing_language(news_item, content_to_use) if language is None else normalize_content_language(language)
+    prompt = build_structured_prompt(news_item, content_to_use, normalized_language)
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "num_ctx": 8192,
+            "temperature": 0.2,
+        },
+    }
+
+    last_error = None
+    for attempt in range(1, LLM_RETRY_LIMIT + 1):
+        try:
+            response = request_with_retry(
+                "POST",
+                OLLAMA_API_URL,
+                session_name="ollama_structured",
+                json=payload,
+                timeout=90,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            raw_output = response.json().get("response", "")
+            parsed = parse_llm_json(raw_output)
+            return normalize_llm_output(parsed, news_item, content_to_use, verified=True, language=normalized_language)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            last_error = exc
+            logger.warning(
+                f"Invalid JSON from Ollama for '{news_item.get('title', '')[:60]}', retry {attempt}/{LLM_RETRY_LIMIT}"
+            )
+            time.sleep(min(2.0, 0.4 * attempt))
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            logger.error(f"Failed to communicate with Ollama API: {exc}")
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"Unexpected Ollama parsing error: {exc}")
+            time.sleep(min(2.0, 0.4 * attempt))
+
+    logger.warning(f"Using safe fallback output for '{news_item.get('title', '')[:60]}': {last_error}")
+    fallback_parsed = {
+        "title": news_item.get("title", ""),
+        "summary": normalize_summary([], fallback_summary_text(news_item, content_to_use)),
+        "category": FALLBACK_CATEGORY,
+        "importance": default_importance_from_rss(int(news_item.get("rss_score", 0))),
+        "image_keyword": news_item.get("title", "Saudi financial news"),
+    }
+    return normalize_llm_output(fallback_parsed, news_item, content_to_use, verified=False, language=normalized_language)
+
+
+def _extract_image_url_from_html(html_text: str) -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1)).strip()
+    return ""
+
+
+def _scrape_full_article_requests_only(
+    url: str,
+    article_title: str | None = None,
+    source_hint: str | None = None,
+) -> tuple[str, str, str, bool]:
+    final_url = url
+    if final_url and ("news.google.com" in final_url.lower() or not is_allowed_domain(final_url)):
+        final_url = shared_resolve_final_url(
+            url,
+            article_title=article_title,
+            source_hint=source_hint,
+        )
+
+    if not final_url or not is_allowed_domain(final_url):
+        logger.warning(f"Rejected article after final URL resolution: {final_url or url}")
+        return "", "", final_url, False
+
+    try:
+        response = request_with_retry(
+            "GET",
+            final_url,
+            session_name="article_html",
+            timeout=20,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        html_text = response.text
+    except Exception as exc:
+        logger.warning(f"Requests-only article fetch failed for {final_url}: {exc}")
+        return "", "", final_url, False
+
+    extracted = trafilatura.extract(
+        html_text,
+        include_comments=False,
+        include_tables=False,
+        favor_precision=True,
+        favor_recall=False,
+    )
+    text = postprocess_domain_text(final_url, clean_extracted_text(extracted or ""))
+    image_url = _extract_image_url_from_html(html_text)
+    article_date = extract_page_date_requests_only(final_url)
+    _scrape_full_article_requests_only.last_article_date = article_date
+    return text, image_url, final_url, False
+
+
+def _refresh_cached_processed_result(cached: dict, news_item: dict) -> dict:
+    updated = deepcopy(cached)
+    rss_score = int(news_item.get("rss_score", updated.get("rss_score", 0)))
+    updated["rss_score"] = rss_score
+    updated["score"] = rss_score
+    updated["published"] = news_item.get("published", updated.get("published", ""))
+    updated["source"] = news_item.get("source", updated.get("source", ""))
+    updated["link"] = updated.get("canonical_url", news_item.get("link", "")) or news_item.get("link", "")
+    updated["language"] = detect_processing_language(news_item, updated.get("original_text", ""))
+    updated["final_score"] = compute_final_score(rss_score, clamp_importance(updated.get("importance", 5)))
+    return updated
+
+
+def _prepare_news_item_for_processing(news_item: dict, page, cache: dict, article_cache: dict):
+    url = news_item.get("link", "")
+    logger.info(f"Preparing to process: '{news_item.get('title', '')[:60]}'")
+
+    cached_result = _get_cached_result_optimized(cache, [url])
+    if cached_result:
+        return {"kind": "result", "result": _refresh_cached_processed_result(cached_result, news_item)}
+
+    final_url = url
+    if final_url and ("news.google.com" in final_url.lower() or not is_allowed_domain(final_url)):
+        final_url = shared_resolve_final_url(
+            url,
+            article_title=news_item.get("title", ""),
+            source_hint=news_item.get("source_domain") or news_item.get("source", ""),
+        )
+
+    if final_url:
+        cached_result = _get_cached_result_optimized(cache, [final_url, url])
+        if cached_result:
+            return {"kind": "result", "result": _refresh_cached_processed_result(cached_result, news_item)}
+
+    if not final_url:
+        logger.warning(f"Skipping article because final URL resolution failed: {url}")
+        return None
+
+    if not is_allowed_domain(final_url):
+        logger.warning(f"Skipping non-approved source after resolution: {final_url}")
+        return None
+
+    article_payload = _get_cached_article(article_cache, [final_url, url])
+    if article_payload:
+        content_to_use = article_payload.get("original_text", "")
+        original_image_url = article_payload.get("original_image_url", "")
+        article_date = _parse_optional_datetime(article_payload.get("article_date", ""))
+    else:
+        full_text = ""
+        original_image_url = ""
+        article_date = None
+
+        if page is not None:
+            full_text, original_image_url, final_url, _ = scrape_full_article(page, final_url)
+            article_date = getattr(scrape_full_article, "last_article_date", None)
+        if len(full_text) < MIN_CONTENT_LENGTH:
+            full_text, original_image_url, final_url, _ = _scrape_full_article_requests_only(final_url)
+            article_date = getattr(_scrape_full_article_requests_only, "last_article_date", article_date)
+
+        content_to_use = full_text if len(full_text) >= MIN_CONTENT_LENGTH else ""
+        if not content_to_use:
+            logger.warning(f"Skipping article because extracted page content was insufficient: {final_url}")
+            return None
+
+        _update_article_cache(
+            article_cache,
+            {
+                "original_text": content_to_use,
+                "original_image_url": original_image_url,
+                "article_date": article_date.isoformat() if article_date else "",
+            },
+            url,
+            final_url,
+        )
+
+    if len(content_to_use) < MIN_CONTENT_LENGTH:
+        logger.warning(f"No usable content found for '{news_item.get('title', '')[:60]}'.")
+        return None
+
+    host = urlparse(final_url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "argaam.com" or host.endswith(".argaam.com"):
+        preview = content_to_use[:300].replace("\n", " ")
+        logger.info(f"Argaam extracted preview: {preview}")
+
+    language = detect_processing_language(news_item, content_to_use)
+    return {
+        "kind": "prepared",
+        "news_item": deepcopy(news_item),
+        "original_url": url,
+        "final_url": final_url,
+        "content_to_use": content_to_use,
+        "original_image_url": original_image_url,
+        "article_date": article_date,
+        "language": language,
+        "structured_hash": _build_structured_hash(news_item, content_to_use, language),
+        "summary_hash": _build_summary_hash(content_to_use, language),
+    }
+
+
+def _compose_processed_result(prepared: dict, structured: dict, summary_lines: list[str]) -> dict:
+    result = deepcopy(structured)
+    rss_score = int(prepared["news_item"].get("rss_score", result.get("rss_score", 0)))
+    result["summary"] = summary_lines
+    result["summary_3_lines"] = "\n".join(summary_lines)
+    result["link"] = prepared["final_url"] or prepared["original_url"]
+    result["canonical_url"] = prepared["final_url"] or prepared["original_url"]
+    result["published"] = prepared["news_item"].get("published", result.get("published", ""))
+    result["source"] = prepared["news_item"].get("source", result.get("source", ""))
+    result["rss_score"] = rss_score
+    result["score"] = rss_score
+    result["original_text"] = prepared["content_to_use"]
+    result["original_image_url"] = prepared["original_image_url"]
+    result["use_original_image"] = bool(prepared["original_image_url"])
+    result["article_date"] = prepared["article_date"].isoformat() if prepared["article_date"] else ""
+    result["language"] = prepared.get("language", detect_processing_language(prepared["news_item"], prepared["content_to_use"]))
+    result["final_score"] = compute_final_score(rss_score, clamp_importance(result.get("importance", 5)))
+    return result
+
+
+def _configure_playwright_event_loop() -> None:
+    try:
+        import asyncio
+        import sys
+
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception as exc:
+        logger.debug(f"Failed to configure Playwright event loop policy: {exc}")
+
+
+def _process_news_item_optimized(news_item: dict, page=None, cache: dict | None = None) -> dict | None:
+    processed_cache = cache if cache is not None else load_cache()
+    article_cache = _load_article_cache()
+
+    prepared = _prepare_news_item_for_processing(news_item, page=page, cache=processed_cache, article_cache=article_cache)
+    if not prepared:
+        return None
+    if prepared["kind"] == "result":
+        return prepared["result"]
+
+    structured = _get_internal_cache(processed_cache, _structured_cache_key(prepared["structured_hash"]), "structured_llm")
+    if structured is None:
+        structured = call_ollama_with_retries(
+            prepared["news_item"],
+            prepared["content_to_use"],
+            language=prepared["language"],
+        )
+        _set_internal_cache(processed_cache, _structured_cache_key(prepared["structured_hash"]), "structured_llm", structured)
+
+    summary_lines = _get_internal_cache(processed_cache, _summary_cache_key(prepared["summary_hash"]), "summary_3_lines")
+    if summary_lines is None:
+        summary_lines = summarize_3_lines(prepared["content_to_use"], language=prepared["language"])
+        _set_internal_cache(processed_cache, _summary_cache_key(prepared["summary_hash"]), "summary_3_lines", summary_lines)
+
+    result = _compose_processed_result(prepared, structured, summary_lines)
+    _update_cache_optimized(processed_cache, result, prepared["original_url"], prepared["final_url"])
+
+    if cache is None:
+        save_cache(processed_cache)
+        _save_article_cache(article_cache)
+    return result
+
+
+def _process_all_news_optimized(news_items: list) -> list:
+    processed: list[dict] = []
+    cache = load_cache()
+    article_cache = _load_article_cache()
+    prepared_items: list[dict] = []
+
+    def _consume(prepared_item) -> None:
+        if not prepared_item:
+            return
+        if prepared_item["kind"] == "result":
+            processed.append(prepared_item["result"])
+        else:
+            prepared_items.append(prepared_item)
+
+    browser = None
+    context = None
+    try:
+        _configure_playwright_event_loop()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font"}
+                else route.continue_(),
+            )
+            page = context.new_page()
+            page.set_default_navigation_timeout(20000)
+            page.set_default_timeout(10000)
+
+            for item in news_items:
+                _consume(_prepare_news_item_for_processing(item, page=page, cache=cache, article_cache=article_cache))
+    except Exception as exc:
+        logger.error(f"Playwright browser initialization failed: {type(exc).__name__}: {exc!r}")
+        for item in news_items:
+            _consume(_prepare_news_item_for_processing(item, page=None, cache=cache, article_cache=article_cache))
+    finally:
+        if context is not None:
+            with contextlib.suppress(Exception):
+                context.close()
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                browser.close()
+
+    structured_results: dict[str, dict] = {}
+    summary_results: dict[str, list[str]] = {}
+    missing_tasks = {}
+
+    for prepared in prepared_items:
+        structured = _get_internal_cache(cache, _structured_cache_key(prepared["structured_hash"]), "structured_llm")
+        if structured is not None:
+            structured_results[prepared["structured_hash"]] = structured
+        else:
+            missing_tasks.setdefault(("structured", prepared["structured_hash"]), prepared)
+
+        summary_lines = _get_internal_cache(cache, _summary_cache_key(prepared["summary_hash"]), "summary_3_lines")
+        if summary_lines is not None:
+            summary_results[prepared["summary_hash"]] = summary_lines
+        else:
+            missing_tasks.setdefault(("summary", prepared["summary_hash"]), prepared)
+
+    if missing_tasks:
+        max_workers = min(max(1, LLM_MAX_WORKERS), len(missing_tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for task_key, prepared in missing_tasks.items():
+                task_type, task_hash = task_key
+                if task_type == "structured":
+                    future = executor.submit(
+                        call_ollama_with_retries,
+                        prepared["news_item"],
+                        prepared["content_to_use"],
+                        prepared["language"],
+                    )
+                else:
+                    future = executor.submit(summarize_3_lines, prepared["content_to_use"], prepared["language"])
+                future_map[future] = (task_type, task_hash, prepared)
+
+            for future in as_completed(future_map):
+                task_type, task_hash, prepared = future_map[future]
+                try:
+                    value = future.result()
+                except Exception as exc:
+                    logger.warning(f"Parallel {task_type} generation failed: {exc}")
+                    if task_type == "structured":
+                        value = normalize_llm_output(
+                            {
+                                "title": prepared["news_item"].get("title", ""),
+                                "summary": normalize_summary([], fallback_summary_text(prepared["news_item"], prepared["content_to_use"])),
+                                "category": FALLBACK_CATEGORY,
+                                "importance": default_importance_from_rss(int(prepared["news_item"].get("rss_score", 0))),
+                                "image_keyword": prepared["news_item"].get("title", "Saudi financial news"),
+                            },
+                            prepared["news_item"],
+                            prepared["content_to_use"],
+                            verified=False,
+                            language=prepared["language"],
+                        )
+                    else:
+                        value = manual_fix_three_lines([], prepared["content_to_use"], prepared["language"])
+
+                if task_type == "structured":
+                    structured_results[task_hash] = value
+                    _set_internal_cache(cache, _structured_cache_key(task_hash), "structured_llm", value)
+                else:
+                    summary_results[task_hash] = value
+                    _set_internal_cache(cache, _summary_cache_key(task_hash), "summary_3_lines", value)
+
+    for prepared in prepared_items:
+        structured = structured_results.get(prepared["structured_hash"])
+        if structured is None:
+            structured = call_ollama_with_retries(
+                prepared["news_item"],
+                prepared["content_to_use"],
+                language=prepared["language"],
+            )
+            _set_internal_cache(cache, _structured_cache_key(prepared["structured_hash"]), "structured_llm", structured)
+
+        summary_lines = summary_results.get(prepared["summary_hash"])
+        if summary_lines is None:
+            summary_lines = summarize_3_lines(prepared["content_to_use"], language=prepared["language"])
+            _set_internal_cache(cache, _summary_cache_key(prepared["summary_hash"]), "summary_3_lines", summary_lines)
+
+        result = _compose_processed_result(prepared, structured, summary_lines)
+        processed.append(result)
+        _update_cache_optimized(cache, result, prepared["original_url"], prepared["final_url"])
+
+    save_cache(cache)
+    _save_article_cache(article_cache)
+    return processed
+
+
+resolve_final_url = shared_resolve_final_url
+load_cache = _load_cache_optimized
+save_cache = _save_cache_optimized
+get_cached_result = _get_cached_result_optimized
+update_cache = _update_cache_optimized
+summarize_3_lines = _summarize_3_lines_optimized
+call_ollama_with_retries = _call_ollama_with_retries_optimized
+process_news_item = _process_news_item_optimized
+process_all_news = _process_all_news_optimized

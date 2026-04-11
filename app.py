@@ -1,10 +1,11 @@
 import html
 import os
+import time
 from datetime import datetime
 
 import streamlit as st
 
-from html_generator import get_news_image_url, generate_report
+from html_generator import export_report_assets, get_news_image_url
 from llm_processor import process_all_news
 from news_fetcher import fetch_valid_news
 
@@ -310,11 +311,113 @@ st.markdown(
 
 # Hero is rendered after we know how many items to show
 _hero_placeholder = st.empty()
+_load_status_placeholder = st.empty()
 
 
-def load_news() -> list:
-    with st.spinner("Fetching, filtering, and ranking news from approved domains..."):
-        return fetch_valid_news(target=RAW_NEWS_LIMIT, days_back=RAW_NEWS_DAYS_BACK)
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_news_cached(target: int, days_back: int) -> list:
+    return fetch_valid_news(target=target, days_back=days_back)
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def load_news(show_progress: bool = False) -> list:
+    if not show_progress:
+        with st.spinner("Fetching, filtering, and ranking news from approved domains..."):
+            return _load_news_cached(RAW_NEWS_LIMIT, RAW_NEWS_DAYS_BACK)
+
+    progress_shell = _load_status_placeholder.container()
+    progress_shell.markdown(
+        """
+        <div class="section-shell">
+            <h3>Feed Progress</h3>
+            <p>Collecting, ranking, and validating articles from approved Saudi sources.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    progress_bar = progress_shell.progress(1)
+    status_line = progress_shell.empty()
+    detail_line = progress_shell.empty()
+    note_line = progress_shell.empty()
+    started_at = time.time()
+
+    def on_progress(event: dict) -> None:
+        progress_value = max(0.0, min(1.0, float(event.get("progress", 0.0))))
+        progress_bar.progress(max(1, min(100, int(progress_value * 100))))
+
+        message = str(event.get("message", "Working...")).strip()
+        status_line.markdown(f"**{message}**")
+
+        parts = []
+        attempt = event.get("attempt")
+        max_batches = event.get("max_batches")
+        if attempt and max_batches:
+            parts.append(f"Batch {attempt}/{max_batches}")
+
+        source_index = event.get("source_index")
+        source_count = event.get("source_count")
+        if source_index and source_count:
+            parts.append(f"RSS {source_index}/{source_count}")
+
+        checked_in_batch = event.get("checked_in_batch")
+        batch_size = event.get("batch_size")
+        if checked_in_batch is not None and batch_size:
+            parts.append(f"Checked {checked_in_batch}/{batch_size}")
+
+        validated_count = event.get("validated_count")
+        target = event.get("target")
+        if validated_count is not None and target:
+            parts.append(f"Validated {validated_count}/{target}")
+
+        selected_candidates = event.get("selected_candidates")
+        if selected_candidates is not None:
+            parts.append(f"Candidates {selected_candidates}")
+
+        candidate_limit = event.get("candidate_limit")
+        if candidate_limit:
+            parts.append(f"Pool {candidate_limit}")
+
+        elapsed = time.time() - started_at
+        parts.append(f"Elapsed {_format_duration(elapsed)}")
+
+        if 0.08 <= progress_value < 0.99:
+            eta_seconds = max(0.0, (elapsed / progress_value) - elapsed)
+            parts.append(f"ETA ~ {_format_duration(eta_seconds)}")
+
+        detail_line.caption(" | ".join(parts))
+
+        stage = str(event.get("stage", "")).strip()
+        if stage == "complete":
+            note_line.success(f"Feed ready: {event.get('final_count', validated_count or 0)} articles loaded.")
+        elif stage.startswith("stopped_"):
+            note_line.info(message)
+
+    news_items = fetch_valid_news(
+        target=RAW_NEWS_LIMIT,
+        days_back=RAW_NEWS_DAYS_BACK,
+        progress_callback=on_progress,
+    )
+    total_elapsed = time.time() - started_at
+    progress_bar.progress(100)
+    status_line.success(f"News feed loaded successfully in {_format_duration(total_elapsed)}.")
+    if news_items:
+        detail_line.caption(f"Loaded {len(news_items)} articles from approved sources.")
+    else:
+        detail_line.caption("No articles were loaded.")
+    return news_items
+
+
+def clear_selection_state() -> None:
+    for key in list(st.session_state.keys()):
+        if key.startswith("chk_"):
+            del st.session_state[key]
 
 
 def reset_selection_flags(total_items: int, value: bool) -> None:
@@ -337,16 +440,30 @@ def format_card_date(value: str) -> str:
         return str(value)[:20]
 
 
-if "raw_news" not in st.session_state:
-    st.session_state.raw_news = load_news()
-    st.session_state.raw_news_days_back = RAW_NEWS_DAYS_BACK
-
-if st.session_state.get("raw_news_days_back") != RAW_NEWS_DAYS_BACK:
-    st.session_state.raw_news = load_news()
-    st.session_state.raw_news_days_back = RAW_NEWS_DAYS_BACK
+if "refresh_requested" not in st.session_state:
+    st.session_state.refresh_requested = False
 
 if "processed_news" not in st.session_state:
     st.session_state.processed_news = None
+
+should_reload_news = "raw_news" not in st.session_state
+should_clear_cache = False
+
+if st.session_state.get("refresh_requested"):
+    should_reload_news = True
+    should_clear_cache = True
+    st.session_state.refresh_requested = False
+elif st.session_state.get("raw_news_days_back") != RAW_NEWS_DAYS_BACK:
+    should_reload_news = True
+
+if should_clear_cache:
+    _load_news_cached.clear()
+
+if should_reload_news:
+    st.session_state.raw_news = load_news(show_progress=True)
+    st.session_state.raw_news_days_back = RAW_NEWS_DAYS_BACK
+    st.session_state.processed_news = None
+    clear_selection_state()
 
 raw_news = sorted(
     st.session_state.raw_news,
@@ -370,7 +487,7 @@ if st.session_state.processed_news is None:
             st.rerun()
     with control_c:
         if st.button("Refresh Feed", width='stretch'):
-            st.session_state.raw_news = load_news()
+            st.session_state.refresh_requested = True
             st.session_state.processed_news = None
             st.rerun()
     with control_d:
@@ -601,41 +718,21 @@ else:
                 img_path = os.path.join(base_dir, "weekly_news_interactive.jpg")
 
                 edited_news_pool.sort(key=lambda item: item.get("final_score", 0), reverse=True)
-                generate_report(
+                export_result = export_report_assets(
                     edited_news_pool,
-                    html_path,
+                    html_output=html_path,
+                    pdf_output=pdf_path,
+                    image_output=img_path,
                     issue_num=issue_num_input,
                     custom_ar_date=custom_ar_date or None,
                     custom_en_date=custom_en_date or None,
                 )
                 st.write("HTML report generated.")
-
-                from playwright.sync_api import sync_playwright
-
-                pdf_success = False
-                img_success = False
-                try:
-                    with sync_playwright() as playwright:
-                        browser = playwright.chromium.launch(headless=True)
-                        page = browser.new_page()
-                        page.set_viewport_size({"width": 1000, "height": 1200})
-                        page.goto(f"file://{html_path}", wait_until="networkidle")
-                        page.emulate_media(media="screen")
-                        content_height = page.evaluate("() => document.documentElement.scrollHeight") + 40
-                        page.pdf(
-                            path=pdf_path,
-                            width="1000px",
-                            height=f"{content_height}px",
-                            print_background=True,
-                            page_ranges="1",
-                            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
-                        )
-                        pdf_success = True
-                        page.screenshot(path=img_path, full_page=True)
-                        img_success = True
-                        browser.close()
-                except Exception as exc:
-                    st.warning(f"Playwright export failed: {exc}")
+                pdf_success = export_result.get("pdf_success", False)
+                img_success = export_result.get("image_success", False)
+                export_error = export_result.get("export_error", "")
+                if export_error:
+                    st.warning(f"Playwright export failed: {export_error}")
 
                 status.update(label="Report generation complete.", state="complete")
 

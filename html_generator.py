@@ -2,13 +2,16 @@ import base64
 import html as html_lib
 import os
 import re
+import sys
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from hijri_converter import Gregorian
 
+from pipeline_utils import request_with_retry
 from utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -51,15 +54,11 @@ def fetch_image_data_uri(image_url: str) -> str:
         return _IMAGE_DATA_CACHE[cache_key]
 
     try:
-        response = requests.get(
+        response = request_with_retry(
+            "GET",
             image_url,
             timeout=10,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
                 "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                 "Referer": image_url,
             },
@@ -366,6 +365,84 @@ def generate_report(
 
     logger.info(f"Successfully generated HTML report: {os.path.abspath(output_filename)}")
     return os.path.abspath(output_filename)
+
+
+def _configure_playwright_event_loop() -> None:
+    try:
+        import asyncio
+
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception as exc:
+        logger.debug(f"Failed to configure Playwright event loop policy for export: {exc}")
+
+
+def export_report_assets(
+    news_items: list,
+    html_output: str = "weekly_news_interactive.html",
+    pdf_output: str | None = "weekly_news_interactive.pdf",
+    image_output: str | None = "weekly_news_interactive.jpg",
+    issue_num: str = "1",
+    custom_ar_date: str | None = None,
+    custom_en_date: str | None = None,
+) -> dict:
+    html_path = os.path.abspath(html_output)
+    pdf_path = os.path.abspath(pdf_output) if pdf_output else ""
+    image_path = os.path.abspath(image_output) if image_output else ""
+
+    generate_report(
+        news_items,
+        html_path,
+        issue_num=issue_num,
+        custom_ar_date=custom_ar_date,
+        custom_en_date=custom_en_date,
+    )
+
+    result = {
+        "html_path": html_path,
+        "pdf_path": pdf_path,
+        "image_path": image_path,
+        "pdf_success": False,
+        "image_success": False,
+        "export_error": "",
+    }
+
+    if not pdf_path and not image_path:
+        return result
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        _configure_playwright_event_loop()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1000, "height": 1200})
+            page.goto(Path(html_path).resolve().as_uri(), wait_until="networkidle")
+            page.emulate_media(media="screen")
+            page.wait_for_timeout(600)
+            content_height = int(page.evaluate("() => document.documentElement.scrollHeight || document.body.scrollHeight || 1200")) + 40
+
+            if pdf_path:
+                page.pdf(
+                    path=pdf_path,
+                    width="1000px",
+                    height=f"{content_height}px",
+                    print_background=True,
+                    page_ranges="1",
+                    margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                )
+                result["pdf_success"] = os.path.exists(pdf_path)
+
+            if image_path:
+                page.screenshot(path=image_path, full_page=True)
+                result["image_success"] = os.path.exists(image_path)
+
+            browser.close()
+    except Exception as exc:
+        logger.warning(f"Playwright asset export failed: {exc}")
+        result["export_error"] = str(exc)
+
+    return result
 
 
 def generate_email_report(news_items: list, output_filename: str = "weekly_news_email.html", issue_num: str = "1"):
