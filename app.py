@@ -1,17 +1,14 @@
 import html
+import json
 import os
-import time
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 
 from html_generator import export_report_assets, get_news_image_url
-from llm_processor import process_all_news
-from news_fetcher import fetch_valid_news
-
 CARD_COLUMNS = 5
-RAW_NEWS_LIMIT = 35
-RAW_NEWS_DAYS_BACK = 7
+LATEST_CACHE_PATH = Path("cache") / "latest.json"
 
 st.set_page_config(page_title="AI Financial News", layout="wide", page_icon="\U0001f4f0")
 
@@ -314,103 +311,71 @@ _hero_placeholder = st.empty()
 _load_status_placeholder = st.empty()
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def _load_news_cached(target: int, days_back: int) -> list:
-    return fetch_valid_news(target=target, days_back=days_back)
+@st.cache_data(show_spinner=False)
+def _load_news_cached(cache_path: str, cache_mtime: float) -> list:
+    del cache_mtime
+    path = Path(cache_path)
+    if not path.exists():
+        return []
+    try:
+        payload = path.read_text(encoding="utf-8").strip()
+        if not payload:
+            return []
+        data = json.loads(payload)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
-def _format_duration(seconds: float) -> str:
-    total_seconds = max(0, int(seconds))
-    minutes, secs = divmod(total_seconds, 60)
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
+def _cache_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _last_updated_label(path: Path) -> str:
+    mtime = _cache_mtime(path)
+    if not mtime:
+        return "N/A"
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+
+
+def _read_cached_news() -> list:
+    return _load_news_cached(str(LATEST_CACHE_PATH), _cache_mtime(LATEST_CACHE_PATH))
 
 
 def load_news(show_progress: bool = False) -> list:
     if not show_progress:
-        with st.spinner("Fetching, filtering, and ranking news from approved domains..."):
-            return _load_news_cached(RAW_NEWS_LIMIT, RAW_NEWS_DAYS_BACK)
+        with st.spinner("Loading cached news feed..."):
+            return _read_cached_news()
 
     progress_shell = _load_status_placeholder.container()
     progress_shell.markdown(
         """
         <div class="section-shell">
             <h3>Feed Progress</h3>
-            <p>Collecting, ranking, and validating articles from approved Saudi sources.</p>
+            <p>Loading cached news from local storage.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    progress_bar = progress_shell.progress(1)
+    progress_bar = progress_shell.progress(5)
     status_line = progress_shell.empty()
     detail_line = progress_shell.empty()
-    note_line = progress_shell.empty()
-    started_at = time.time()
 
-    def on_progress(event: dict) -> None:
-        progress_value = max(0.0, min(1.0, float(event.get("progress", 0.0))))
-        progress_bar.progress(max(1, min(100, int(progress_value * 100))))
-
-        message = str(event.get("message", "Working...")).strip()
-        status_line.markdown(f"**{message}**")
-
-        parts = []
-        attempt = event.get("attempt")
-        max_batches = event.get("max_batches")
-        if attempt and max_batches:
-            parts.append(f"Batch {attempt}/{max_batches}")
-
-        source_index = event.get("source_index")
-        source_count = event.get("source_count")
-        if source_index and source_count:
-            parts.append(f"RSS {source_index}/{source_count}")
-
-        checked_in_batch = event.get("checked_in_batch")
-        batch_size = event.get("batch_size")
-        if checked_in_batch is not None and batch_size:
-            parts.append(f"Checked {checked_in_batch}/{batch_size}")
-
-        validated_count = event.get("validated_count")
-        target = event.get("target")
-        if validated_count is not None and target:
-            parts.append(f"Validated {validated_count}/{target}")
-
-        selected_candidates = event.get("selected_candidates")
-        if selected_candidates is not None:
-            parts.append(f"Candidates {selected_candidates}")
-
-        candidate_limit = event.get("candidate_limit")
-        if candidate_limit:
-            parts.append(f"Pool {candidate_limit}")
-
-        elapsed = time.time() - started_at
-        parts.append(f"Elapsed {_format_duration(elapsed)}")
-
-        if 0.08 <= progress_value < 0.99:
-            eta_seconds = max(0.0, (elapsed / progress_value) - elapsed)
-            parts.append(f"ETA ~ {_format_duration(eta_seconds)}")
-
-        detail_line.caption(" | ".join(parts))
-
-        stage = str(event.get("stage", "")).strip()
-        if stage == "complete":
-            note_line.success(f"Feed ready: {event.get('final_count', validated_count or 0)} articles loaded.")
-        elif stage.startswith("stopped_"):
-            note_line.info(message)
-
-    news_items = fetch_valid_news(
-        target=RAW_NEWS_LIMIT,
-        days_back=RAW_NEWS_DAYS_BACK,
-        progress_callback=on_progress,
-    )
-    total_elapsed = time.time() - started_at
+    status_line.markdown("**Reading `cache/latest.json`...**")
+    progress_bar.progress(45)
+    news_items = _read_cached_news()
     progress_bar.progress(100)
-    status_line.success(f"News feed loaded successfully in {_format_duration(total_elapsed)}.")
+
+    last_updated = _last_updated_label(LATEST_CACHE_PATH)
     if news_items:
-        detail_line.caption(f"Loaded {len(news_items)} articles from approved sources.")
+        status_line.success("Cached feed loaded successfully.")
+        detail_line.caption(f"Loaded {len(news_items)} cached articles | Last updated {last_updated}")
     else:
-        detail_line.caption("No articles were loaded.")
+        status_line.warning("No cached feed found.")
+        detail_line.caption("Run `pipeline_scheduler.py` to generate `cache/latest.json`.")
     return news_items
 
 
@@ -447,21 +412,13 @@ if "processed_news" not in st.session_state:
     st.session_state.processed_news = None
 
 should_reload_news = "raw_news" not in st.session_state
-should_clear_cache = False
 
 if st.session_state.get("refresh_requested"):
     should_reload_news = True
-    should_clear_cache = True
     st.session_state.refresh_requested = False
-elif st.session_state.get("raw_news_days_back") != RAW_NEWS_DAYS_BACK:
-    should_reload_news = True
-
-if should_clear_cache:
-    _load_news_cached.clear()
 
 if should_reload_news:
     st.session_state.raw_news = load_news(show_progress=True)
-    st.session_state.raw_news_days_back = RAW_NEWS_DAYS_BACK
     st.session_state.processed_news = None
     clear_selection_state()
 
@@ -494,6 +451,7 @@ if st.session_state.processed_news is None:
         st.metric("Selected News", selected_count)
 
     total_news = len(raw_news)
+    last_updated_value = _last_updated_label(LATEST_CACHE_PATH)
     _hero_placeholder.markdown(
         f"""
         <div class="hero-shell">
@@ -504,7 +462,7 @@ if st.session_state.processed_news is None:
             <div class="hero-stats">
               <div class="hero-stat"><span class="hero-stat-val">{total_news}</span><span class="hero-stat-lbl">خبر متاح</span></div>
               <div class="hero-stat"><span class="hero-stat-val" id="sel-count-hero">{selected_count}</span><span class="hero-stat-lbl">تم تحديده</span></div>
-              <div class="hero-stat"><span class="hero-stat-val">{RAW_NEWS_DAYS_BACK}</span><span class="hero-stat-lbl">أيام للخلف</span></div>
+              <div class="hero-stat"><span class="hero-stat-val">{last_updated_value}</span><span class="hero-stat-lbl">آخر تحديث</span></div>
             </div>
           </div>
         </div>
@@ -523,7 +481,7 @@ if st.session_state.processed_news is None:
     )
 
     if not raw_news:
-        st.warning("No news retrieved. Check network connectivity or approved source coverage.")
+        st.warning("No cached news available. Please run pipeline_scheduler.py.")
     else:
         for start in range(0, len(raw_news), CARD_COLUMNS):
             columns = st.columns(CARD_COLUMNS, gap="small")
@@ -572,6 +530,8 @@ if st.session_state.processed_news is None:
             st.error("Select at least one article before generating the report.")
         else:
             with st.spinner("Resolving articles, extracting content, and generating structured summaries..."):
+                from llm_processor import process_all_news
+
                 processed_news = process_all_news(selected_news)
                 processed_news.sort(key=lambda item: item.get("final_score", 0), reverse=True)
                 if not processed_news:

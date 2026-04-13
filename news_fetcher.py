@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
@@ -63,7 +64,7 @@ def _emit_progress(progress_callback, *, stage: str, message: str, progress: flo
     try:
         progress_callback(payload)
     except Exception as exc:
-        logger.debug(f"Progress callback failed during stage '{stage}': {exc}")
+        logger.debug("Progress callback failed during stage '%s': %s", stage, exc)
 
 
 def _matches_domain(domain: str, target: str) -> bool:
@@ -351,7 +352,49 @@ _COMMON_SOURCE_SUFFIXES = {
     "the wall street journal",
 }
 
+_ALLOWED_DOMAIN_PAIRS = tuple((domain, domain.split(".")[0]) for domain in ALLOWED_DOMAINS)
+_ALLOWED_DOMAIN_MATCHERS = tuple((domain, f".{domain}") for domain in ALLOWED_DOMAINS)
+_DOMAIN_SEARCH_CLAUSE = " OR ".join(f"site:{domain}" for domain in ALLOWED_DOMAINS)
 
+_MULTI_SPACE_RE = re.compile(r"\s+")
+_NON_WORD_ARABIC_RE = re.compile(r"[^\w\s\u0600-\u06FF]", flags=re.UNICODE)
+_TITLE_SOURCE_SUFFIX_RE = re.compile(r"^(.*?)(?:\s*(?:\||-|\u2013|\u2014)\s*)([^|\u2013\u2014-]{1,80})$")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_RSS_HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', flags=re.IGNORECASE)
+_URL_REDIRECT_HINT_RE = re.compile(
+    r'(?:window\.location(?:\.href)?\s*=\s*|url=|content=["\']\d+;\s*url=)["\']?(https?://[^"\'\s;]+)',
+    flags=re.IGNORECASE,
+)
+_PAGE_DATE_CLEAN_TIME_RE = re.compile(r"\s+\u0641\u064a\s+\d{1,2}:\d{2}\s*\S*")
+_PAGE_DATE_YMD_RE = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
+_PAGE_DATE_DMY_RE = re.compile(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})")
+_PAGE_DATE_ARABIC_RE = re.compile(r"(\d{1,2})\s+([^\s\d]+?[\u0600-\u06FF][^\s\d]*)\s+(\d{4})")
+_URL_PATH_DATE_RE = re.compile(r"/(20\d{2})/(\d{1,2})/(\d{1,2})(?:/|$)")
+_MAAAL_DATE_JSON_RE = re.compile(r'"datePublished"\s*:\s*"([^"]+)"', flags=re.IGNORECASE)
+_ARABIC_DATE_TEXT_RE = re.compile(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}")
+_SPA_META_DESCRIPTION_RE = re.compile(r'meta name="description" content="([^"]+)"', flags=re.IGNORECASE)
+_SPA_DATE_RE = re.compile(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}\s*[\u0645\u0647\u0640]?")
+_TITLE_DEDUPE_NON_WORD_RE = re.compile(r"[^\w\u0600-\u06FF ]+")
+_UNIVERSAL_DATE_REGEXES = tuple(
+    re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
+    for pattern in (
+        r'<time[^>]*datetime="([^"]+)"',
+        r'<time[^>]*>([^<]+)</time>',
+        r'meta property="article:published_time" content="([^"]+)"',
+        r'meta property="og:updated_time" content="([^"]+)"',
+        r'meta name="pubdate" content="([^"]+)"',
+        r'meta name="publishdate" content="([^"]+)"',
+        r'meta name="date" content="([^"]+)"',
+        r'meta itemprop="datePublished" content="([^"]+)"',
+        r'class="[^"]*(?:date-posted|entry-date|post-date|article-date|news-date)[^"]*"[^>]*>([^<]+)<',
+    )
+)
+_ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\b")
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_SLASH_DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+
+
+@lru_cache(maxsize=16384)
 def _normalize_text_for_match(text: str) -> str:
     normalized = clean_html(text or "")
     normalized = normalize_arabic_digits(normalized)
@@ -359,9 +402,27 @@ def _normalize_text_for_match(text: str) -> str:
     normalized = _ARABIC_DIACRITICS_RE.sub("", normalized)
     normalized = normalized.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     normalized = normalized.replace("ٱ", "ا").replace("ى", "ي")
-    normalized = re.sub(r"[^\w\s\u0600-\u06FF]", " ", normalized, flags=re.UNICODE)
-    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    normalized = _NON_WORD_ARABIC_RE.sub(" ", normalized)
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized).strip().lower()
     return normalized
+
+
+@lru_cache(maxsize=1)
+def _get_source_hint_alias_normalized() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (normalized_alias, domain)
+        for alias, domain in _SOURCE_HINT_DOMAIN_MAP.items()
+        for normalized_alias in (_normalize_text_for_match(alias),)
+        if normalized_alias
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_allowed_domain_token_map() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (_normalize_text_for_match(domain.split(".")[0]), domain)
+        for domain in ALLOWED_DOMAINS
+    )
 
 
 def _looks_like_source_suffix(fragment: str) -> bool:
@@ -379,16 +440,16 @@ def clean_title(title: str) -> str:
     cleaned = clean_html(title or "")
     cleaned = normalize_arabic_digits(cleaned)
     cleaned = cleaned.replace("\u200f", " ").replace("\u200e", " ").replace("\ufeff", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n-|")
+    cleaned = _MULTI_SPACE_RE.sub(" ", cleaned).strip(" \t\r\n-|")
     for _ in range(3):
-        match = re.match(r"^(.*?)(?:\s*(?:\||-|\u2013|\u2014)\s*)([^|\u2013\u2014-]{1,80})$", cleaned)
+        match = _TITLE_SOURCE_SUFFIX_RE.match(cleaned)
         if not match:
             break
         candidate = match.group(2).strip()
         if not _looks_like_source_suffix(candidate):
             break
         cleaned = match.group(1).strip(" \t\r\n-|")
-    return re.sub(r"\s+", " ", cleaned).strip()
+    return _MULTI_SPACE_RE.sub(" ", cleaned).strip()
 
 
 def _normalize_source_hint(source_hint: str | None) -> str | None:
@@ -403,21 +464,19 @@ def _normalize_source_hint(source_hint: str | None) -> str | None:
         host_candidate = normalize_domain(f"https://{raw_hint}")
 
     if host_candidate:
-        for allowed in ALLOWED_DOMAINS:
-            if _matches_domain(host_candidate, allowed):
+        for allowed, suffix in _ALLOWED_DOMAIN_MATCHERS:
+            if host_candidate == allowed or host_candidate.endswith(suffix):
                 return allowed
 
     normalized = _normalize_text_for_match(raw_hint)
     if not normalized:
         return None
 
-    for alias, domain in _SOURCE_HINT_DOMAIN_MAP.items():
-        alias_normalized = _normalize_text_for_match(alias)
+    for alias_normalized, domain in _get_source_hint_alias_normalized():
         if alias_normalized and (normalized == alias_normalized or alias_normalized in normalized):
             return domain
 
-    for domain in ALLOWED_DOMAINS:
-        domain_token = _normalize_text_for_match(domain.split(".")[0])
+    for domain_token, domain in _get_allowed_domain_token_map():
         if domain_token and domain_token in normalized:
             return domain
 
@@ -435,7 +494,7 @@ def _infer_source_domain(*hints: str | None) -> str:
 def clean_html(raw_html: str) -> str:
     if not raw_html:
         return ""
-    clean_text = re.sub(r"<[^>]+>", "", raw_html)
+    clean_text = _HTML_TAG_RE.sub("", raw_html)
     return html.unescape(clean_text).strip()
 
 
@@ -463,7 +522,7 @@ ARABIC_MONTHS = {
 ARABIC_DIGIT_TRANSLATION = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
-
+@lru_cache(maxsize=8192)
 def normalize_domain(url: str) -> str:
     host = urlparse(url).netloc.lower()
     if host.startswith("www."):
@@ -715,16 +774,18 @@ def _extract_real_url_from_rss_entry(entry) -> str | None:
             raw = raw.get("value", "")
         if not raw:
             continue
-        matches = re.findall(r'href=["\']([^"\']+)["\']', raw, re.IGNORECASE)
-        for href in matches:
+        for match in _RSS_HREF_RE.finditer(raw):
+            href = match.group(1)
             if href.startswith("http") and "news.google.com" not in href and _is_article_url(href):
                 return href
 
     # 3. content[] field in some feed formats
     for content in entry.get("content", []):
         value = content.get("value", "")
-        matches = re.findall(r'href=["\']([^"\']+)["\']', value, re.IGNORECASE)
-        for href in matches:
+        if not value:
+            continue
+        for match in _RSS_HREF_RE.finditer(value):
+            href = match.group(1)
             if href.startswith("http") and "news.google.com" not in href and _is_article_url(href):
                 return href
 
@@ -834,8 +895,7 @@ def _build_search_queries(title: str, expected_domain: str | None = None) -> lis
     if expected_domain:
         queries.append(f"{quoted} site:{expected_domain}")
     else:
-        domain_clause = " OR ".join(f"site:{domain}" for domain in ALLOWED_DOMAINS)
-        queries.append(f"{quoted} ({domain_clause})")
+        queries.append(f"{quoted} ({_DOMAIN_SEARCH_CLAUSE})")
     queries.append(quoted)
     return queries
 
@@ -944,11 +1004,7 @@ def resolve_final_url(url: str, article_title: str | None = None, source_hint: s
             return resolved
 
         # Google sometimes uses window.location or meta-refresh JS redirects
-        location_match = re.search(
-            r'(?:window\.location(?:\.href)?\s*=\s*|url=|content=["\']\d+;\s*url=)["\']?(https?://[^"\'\s;]+)',
-            resp.text,
-            re.IGNORECASE,
-        )
+        location_match = _URL_REDIRECT_HINT_RE.search(resp.text or "")
         if location_match:
             candidate = location_match.group(1)
             if "news.google.com" not in urlparse(candidate).netloc.lower():
@@ -1003,9 +1059,9 @@ def parse_page_date_text(date_text: str) -> datetime | None:
     if not date_text:
         return None
     normalized = normalize_arabic_digits(clean_html(date_text))
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized).strip()
     normalized = normalized.replace("،", " ").replace(",", " ")
-    normalized = re.sub(r"\s+في\s+\d{1,2}:\d{2}\s*\S*", "", normalized)
+    normalized = _PAGE_DATE_CLEAN_TIME_RE.sub("", normalized)
 
     def _to_gregorian_year(y: int) -> int:
         """Convert a Hijri year to approximate Gregorian year.
@@ -1017,7 +1073,7 @@ def parse_page_date_text(date_text: str) -> datetime | None:
             return y + 622 - y // 33
         return y
 
-    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", normalized)
+    m = _PAGE_DATE_YMD_RE.search(normalized)
     if m:
         y, mo, d = map(int, m.groups())
         y = _to_gregorian_year(y)
@@ -1026,7 +1082,7 @@ def parse_page_date_text(date_text: str) -> datetime | None:
         except ValueError:
             return None
 
-    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", normalized)
+    m = _PAGE_DATE_DMY_RE.search(normalized)
     if m:
         d, mo, y = map(int, m.groups())
         y = _to_gregorian_year(y)
@@ -1037,7 +1093,7 @@ def parse_page_date_text(date_text: str) -> datetime | None:
 
     # Try every date-shaped substring — the first match may be a Hijri date
     # with an unrecognised month name (e.g. 'شوال'), so we must keep trying.
-    for m in re.finditer(r"(\d{1,2})\s+([^\s\d]+?[\u0600-\u06FF][^\s\d]*)\s+(\d{4})", normalized):
+    for m in _PAGE_DATE_ARABIC_RE.finditer(normalized):
         day = int(m.group(1))
         month_name = m.group(2).strip().lower()
         year = int(m.group(3))
@@ -1053,7 +1109,7 @@ def parse_page_date_text(date_text: str) -> datetime | None:
 
 def _extract_date_from_url_path(url: str) -> datetime | None:
     path = urlparse(url or "").path
-    match = re.search(r"/(20\d{2})/(\d{1,2})/(\d{1,2})(?:/|$)", path)
+    match = _URL_PATH_DATE_RE.search(path)
     if not match:
         return None
 
@@ -1068,12 +1124,12 @@ def _extract_maaal_date_from_html(html_text: str) -> datetime | None:
     if not html_text:
         return None
 
-    for candidate in re.findall(r'"datePublished"\s*:\s*"([^"]+)"', html_text, flags=re.IGNORECASE):
-        parsed = parse_page_date_text(candidate)
+    for match in _MAAAL_DATE_JSON_RE.finditer(html_text):
+        parsed = parse_page_date_text(match.group(1))
         if parsed:
             return parsed
 
-    match = re.search(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}", html_text)
+    match = _ARABIC_DATE_TEXT_RE.search(html_text)
     if match:
         parsed = parse_page_date_text(match.group(0))
         if parsed:
@@ -1088,12 +1144,10 @@ def _extract_spa_date_from_html(html_text: str) -> datetime | None:
 
     candidates: list[str] = []
 
-    for description in re.findall(r'meta name="description" content="([^"]+)"', html_text, flags=re.IGNORECASE):
-        candidates.extend(
-            re.findall(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}\s*[\u0645\u0647\u0640]?", description)
-        )
+    for description_match in _SPA_META_DESCRIPTION_RE.finditer(html_text):
+        candidates.extend(match.group(0) for match in _SPA_DATE_RE.finditer(description_match.group(1)))
 
-    candidates.extend(re.findall(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}\s*[\u0645\u0647\u0640]?", html_text))
+    candidates.extend(match.group(0) for match in _SPA_DATE_RE.finditer(html_text))
 
     for candidate in candidates:
         parsed = parse_page_date_text(candidate)
@@ -1341,7 +1395,7 @@ def extract_page_date_requests_only(url: str) -> datetime | None:
 
 def is_allowed_domain(url: str) -> bool:
     host = normalize_domain(url)
-    return any(host == domain or host.endswith(f".{domain}") for domain in ALLOWED_DOMAINS)
+    return any(host == domain or host.endswith(suffix) for domain, suffix in _ALLOWED_DOMAIN_MATCHERS)
 
 
 # Strong Saudi geographic/institutional indicators used by is_saudi_news()
@@ -1372,7 +1426,7 @@ def is_saudi_news(title: str, description: str) -> bool:
     non-Saudi subject (e.g. global markets, other countries).
     """
     text = f"{title} {description}".lower()
-    return any(kw.lower() in text for kw in SAUDI_KEYWORDS)
+    return any(keyword in text for keyword in SAUDI_KEYWORDS_LOWER)
 
 
 SAUDI_KEYWORDS.extend(
@@ -1390,6 +1444,7 @@ SAUDI_KEYWORDS.extend(
         "public investment fund",
     ]
 )
+SAUDI_KEYWORDS_LOWER = tuple(keyword.lower() for keyword in SAUDI_KEYWORDS)
 
 
 def detect_language(text: str) -> str:
@@ -1503,25 +1558,32 @@ def score_news(title: str, description: str) -> int:
 
 def normalize_title_for_dedupe(title: str) -> str:
     normalized = clean_html(title).lower()
-    normalized = re.sub(r"\s+", " ", normalized)
-    normalized = re.sub(r"[^\w\u0600-\u06FF ]+", " ", normalized)
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized)
+    normalized = _TITLE_DEDUPE_NON_WORD_RE.sub(" ", normalized)
     return normalized.strip()
 
 
-def is_near_duplicate(title: str, existing_titles: list[str]) -> bool:
+def is_near_duplicate(
+    title: str,
+    existing_titles: list[str],
+    existing_token_sets: list[set[str]] | None = None,
+) -> bool:
     normalized = normalize_title_for_dedupe(title)
     if not normalized:
         return False
 
     normalized_tokens = set(normalized.split())
-    for existing in existing_titles:
+    for index, existing in enumerate(existing_titles):
         if normalized == existing:
             return True
 
         if SequenceMatcher(None, normalized, existing).ratio() >= 0.9:
             return True
 
-        existing_tokens = set(existing.split())
+        if existing_token_sets is not None and index < len(existing_token_sets):
+            existing_tokens = existing_token_sets[index]
+        else:
+            existing_tokens = set(existing.split())
         if normalized_tokens and existing_tokens:
             overlap = len(normalized_tokens & existing_tokens) / max(len(normalized_tokens), len(existing_tokens))
             if overlap >= 0.8:
@@ -1530,6 +1592,7 @@ def is_near_duplicate(title: str, existing_titles: list[str]) -> bool:
     return False
 
 
+@lru_cache(maxsize=8192)
 def parse_date(date_str: str) -> datetime:
     try:
         parsed = parsedate_to_datetime(date_str)
@@ -1810,7 +1873,7 @@ def fetch_rss_news(limit: int = 35, days_back: int = 7, enforce_language_balance
                 # Hard Saudi-context gate: skip articles with no Saudi indicator
                 # regardless of domain or financial keywords.
                 if not is_saudi_news(title, description):
-                    logger.debug(f"Skipped (no Saudi context): {title[:60]}")
+                    logger.debug("Skipped (no Saudi context): %s", title[:60])
                     continue
 
                 if " / " in title:
@@ -1845,11 +1908,14 @@ def fetch_rss_news(limit: int = 35, days_back: int = 7, enforce_language_balance
         reverse=True,
     )
 
-    seen_titles = []
+    seen_titles: list[str] = []
+    seen_title_tokens: list[set[str]] = []
     unique_news = []
     for item in all_news:
-        if not is_near_duplicate(item["title"], seen_titles):
-            seen_titles.append(normalize_title_for_dedupe(item["title"]))
+        if not is_near_duplicate(item["title"], seen_titles, seen_title_tokens):
+            normalized_title = normalize_title_for_dedupe(item["title"])
+            seen_titles.append(normalized_title)
+            seen_title_tokens.append(set(normalized_title.split()))
             unique_news.append(item)
 
     if enforce_language_balance:
@@ -1898,7 +1964,7 @@ def _resolve_final_url_optimized(
         )
         resolved = resp.url
         if resolved and "news.google.com" not in urlparse(resolved).netloc.lower():
-            logger.debug(f"Resolved via HTTP redirect: {resolved}")
+            logger.debug("Resolved via HTTP redirect: %s", resolved)
             _set_cached_resolve_value(url, resolved)
             return resolved
 
@@ -1910,7 +1976,7 @@ def _resolve_final_url_optimized(
         if location_match:
             candidate = location_match.group(1)
             if "news.google.com" not in urlparse(candidate).netloc.lower():
-                logger.debug(f"Resolved via page redirect hint: {candidate}")
+                logger.debug("Resolved via page redirect hint: %s", candidate)
                 _set_cached_resolve_value(url, candidate)
                 return candidate
     except Exception as exc:
@@ -1930,7 +1996,7 @@ def _resolve_final_url_optimized(
         while time.time() < deadline:
             current = driver.current_url
             if current and "news.google.com" not in urlparse(current).netloc.lower():
-                logger.debug(f"Resolved via Selenium: {current}")
+                logger.debug("Resolved via Selenium: %s", current)
                 _set_cached_resolve_value(url, current)
                 return current
             time.sleep(0.4)
@@ -1965,6 +2031,8 @@ def _fetch_rss_source_entries(url: str) -> list[dict]:
             logger.warning(f"Feed parser warning for {url}: {feed.bozo_exception}")
 
         collected: list[dict] = []
+        collected_append = collected.append
+        allowed_domain_pairs = _ALLOWED_DOMAIN_PAIRS
         for entry in feed.entries[:40]:
             title = clean_html(entry.get("title", "No Title"))
             real_url = _extract_real_url_from_rss_entry(entry)
@@ -1973,14 +2041,14 @@ def _fetch_rss_source_entries(url: str) -> list[dict]:
             published = entry.get("published", "")
 
             is_allowed = False
-            source_href = entry.get("source", {}).get("href", "").lower()
-            source_title = entry.get("source", {}).get("title", "").lower()
+            source_info = entry.get("source") or {}
+            source_href = str(source_info.get("href", "")).lower()
+            source_title = str(source_info.get("title", "")).lower()
             title_lower = title.lower()
             link_lower = link.lower()
             source_name = source_title if source_title else "Unknown"
 
-            for domain in ALLOWED_DOMAINS:
-                domain_clean = domain.split(".")[0]
+            for domain, domain_clean in allowed_domain_pairs:
                 if (
                     domain in source_href
                     or domain in source_title
@@ -2002,7 +2070,7 @@ def _fetch_rss_source_entries(url: str) -> list[dict]:
                 source_domain = normalize_domain(link)
 
             if not is_saudi_news(title, description):
-                logger.debug(f"Skipped (no Saudi context): {title[:60]}")
+                logger.debug("Skipped (no Saudi context): %s", title[:60])
                 continue
 
             if " / " in title:
@@ -2013,7 +2081,7 @@ def _fetch_rss_source_entries(url: str) -> list[dict]:
             rss_score = score_news(title, description)
             business_bucket = detect_business_bucket(title, description)
             language = detect_language(f"{title} {description}")
-            collected.append(
+            collected_append(
                 {
                     "title": title,
                     "description": description,
@@ -2077,11 +2145,14 @@ def _fetch_rss_news_optimized(
         reverse=True,
     )
 
-    seen_titles = []
+    seen_titles: list[str] = []
+    seen_title_tokens: list[set[str]] = []
     unique_news = []
     for item in all_news:
-        if not is_near_duplicate(item["title"], seen_titles):
-            seen_titles.append(normalize_title_for_dedupe(item["title"]))
+        if not is_near_duplicate(item["title"], seen_titles, seen_title_tokens):
+            normalized_title = normalize_title_for_dedupe(item["title"])
+            seen_titles.append(normalized_title)
+            seen_title_tokens.append(set(normalized_title.split()))
             unique_news.append(item)
 
     _emit_progress(
@@ -2129,6 +2200,11 @@ def _fetch_valid_news_optimized(
     previous_batch_signature = ""
     validation_progress_start = 0.05
     validation_progress_span = 0.90
+    validate_article_fn = validate_article
+    normalize_domain_fn = normalize_domain
+    finalize_selection_fn = _finalize_valid_news_selection
+    has_required_language_mix_fn = _has_required_language_mix
+    collected_append = collected.append
 
     _emit_progress(
         progress_callback,
@@ -2227,7 +2303,7 @@ def _fetch_valid_news_optimized(
                 new_candidates_in_batch += 1
                 processed_in_batch += 1
 
-                is_valid, resolved_link = validate_article(item, days_back=days_back)
+                is_valid, resolved_link = validate_article_fn(item, days_back=days_back)
                 if not is_valid:
                     if processed_in_batch == 1 or processed_in_batch % 5 == 0:
                         _emit_progress(
@@ -2246,10 +2322,10 @@ def _fetch_valid_news_optimized(
                     continue
 
                 item["link"] = resolved_link or link
-                item["source_domain"] = normalize_domain(item["link"])
+                item["source_domain"] = normalize_domain_fn(item["link"])
                 seen_titles.add(title)
                 seen_links.add(item["link"])
-                collected.append(item)
+                collected_append(item)
                 new_validated_in_batch += 1
 
                 _emit_progress(
@@ -2266,8 +2342,8 @@ def _fetch_valid_news_optimized(
                     candidate_limit=current_limit,
                 )
 
-                if len(collected) >= target and _has_required_language_mix(collected, target):
-                    final_selection = _finalize_valid_news_selection(collected, target)
+                if len(collected) >= target and has_required_language_mix_fn(collected, target):
+                    final_selection = finalize_selection_fn(collected, target)
                     logger.info(
                         f"Collected {len(collected)} validated articles and finalized {len(final_selection)} "
                         f"items (target {target})."
@@ -2304,7 +2380,7 @@ def _fetch_valid_news_optimized(
                 )
                 break
 
-        final_selection = _finalize_valid_news_selection(collected, target)
+        final_selection = finalize_selection_fn(collected, target)
         logger.info(
             f"Collected {len(collected)} validated articles after {max_batches} batches "
             f"and finalized {len(final_selection)} items (target {target})."
@@ -2430,25 +2506,14 @@ def _extract_page_date_requests_only_optimized(url: str) -> datetime | None:
             if parsed:
                 return parsed
 
-        patterns = [
-            r'<time[^>]*datetime="([^"]+)"',
-            r'<time[^>]*>([^<]+)</time>',
-            r'meta property="article:published_time" content="([^"]+)"',
-            r'meta property="og:updated_time" content="([^"]+)"',
-            r'meta name="pubdate" content="([^"]+)"',
-            r'meta name="publishdate" content="([^"]+)"',
-            r'meta name="date" content="([^"]+)"',
-            r'meta itemprop="datePublished" content="([^"]+)"',
-            r'class="[^"]*(?:date-posted|entry-date|post-date|article-date|news-date)[^"]*"[^>]*>([^<]+)<',
-        ]
         candidates: list[str] = []
-        for pattern in patterns:
-            candidates.extend(re.findall(pattern, html_text, flags=re.IGNORECASE | re.DOTALL))
+        for regex in _UNIVERSAL_DATE_REGEXES:
+            candidates.extend(match.group(1) for match in regex.finditer(html_text))
 
-        candidates.extend(re.findall(r'"datePublished"\s*:\s*"([^"]+)"', html_text, flags=re.IGNORECASE))
-        candidates.extend(re.findall(r'\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\b', html_text))
-        candidates.extend(re.findall(r'\b\d{4}-\d{2}-\d{2}\b', html_text))
-        candidates.extend(re.findall(r'\b\d{2}/\d{2}/\d{4}\b', html_text))
+        candidates.extend(match.group(1) for match in _MAAAL_DATE_JSON_RE.finditer(html_text))
+        candidates.extend(match.group(0) for match in _ISO_DATETIME_RE.finditer(html_text))
+        candidates.extend(match.group(0) for match in _ISO_DATE_RE.finditer(html_text))
+        candidates.extend(match.group(0) for match in _SLASH_DATE_RE.finditer(html_text))
 
         for candidate in candidates:
             parsed = parse_page_date_text(candidate)
