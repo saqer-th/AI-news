@@ -4,7 +4,6 @@ import glob
 import html
 import io
 import os
-import random
 import re
 import threading
 import time
@@ -19,16 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
-from pipeline_utils import (
-    RSS_HEADERS,
-    TTLMemoryCache,
-    get_http_session,
-    load_json_cache,
-    request_with_retry,
-    save_json_cache,
-    stable_hash,
-    utc_now_iso,
-)
+from pipeline_utils import RSS_HEADERS, TTLMemoryCache, load_json_cache, request_with_retry, save_json_cache, stable_hash, utc_now_iso
 from utils import setup_logger
 try:
     from bs4 import BeautifulSoup as _BS4
@@ -75,10 +65,6 @@ def _emit_progress(progress_callback, *, stage: str, message: str, progress: flo
         progress_callback(payload)
     except Exception as exc:
         logger.debug("Progress callback failed during stage '%s': %s", stage, exc)
-
-
-def _network_jitter(min_delay: float = 0.2, max_delay: float = 0.5) -> None:
-    time.sleep(random.uniform(min_delay, max_delay))
 
 
 def _matches_domain(domain: str, target: str) -> bool:
@@ -645,23 +631,6 @@ def _retry_cached_google_miss(
     return cached_value
 
 
-def _extract_google_target_from_url(url: str) -> str | None:
-    parsed = urlparse(url or "")
-    if "news.google.com" not in parsed.netloc.lower():
-        return None
-
-    query_params = parse_qs(parsed.query or "")
-    for key in ("url", "u", "q"):
-        for raw_value in query_params.get(key, []):
-            candidate = unquote(str(raw_value or "").strip())
-            if not candidate or not candidate.startswith("http"):
-                continue
-            if "news.google.com" in urlparse(candidate).netloc.lower():
-                continue
-            return candidate
-    return None
-
-
 def _cleanup_stale_chromedriver(force: bool = False) -> None:
     """Delete stale chromedriver.exe files left by crashed sessions.
 
@@ -960,10 +929,6 @@ def search_real_url(title: str, expected_source: str | None = None) -> str | Non
             "params_builder": lambda query: {"q": query, "setlang": "ar-SA"},
         },
     ]
-    search_sessions = {
-        spec["session"]: get_http_session(session_name=spec["session"], pool_connections=6, pool_maxsize=12)
-        for spec in search_specs
-    }
 
     try:
         for query in _build_search_queries(cleaned, expected_domain):
@@ -973,7 +938,6 @@ def search_real_url(title: str, expected_source: str | None = None) -> str | Non
                         "GET",
                         spec["url"],
                         session_name=spec["session"],
-                        session=search_sessions[spec["session"]],
                         params=spec["params_builder"](query),
                         timeout=6,
                         headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
@@ -983,8 +947,6 @@ def search_real_url(title: str, expected_source: str | None = None) -> str | Non
                 except Exception as exc:
                     logger.warning(f"{spec['engine']} title search failed for '{cleaned[:80]}': {exc}")
                     continue
-                finally:
-                    _network_jitter(0.2, 0.35)
 
                 for candidate in _extract_search_results(response.text, base_url=response.url, engine=spec["engine"]):
                     if validate_match(cleaned, candidate["url"], candidate["title"], expected_domain):
@@ -1989,15 +1951,11 @@ def _resolve_final_url_optimized(
         _set_cached_resolve_value(url, url)
         return url
 
-    resolver_session = get_http_session(session_name="url_resolver", pool_connections=12, pool_maxsize=24)
-    response_text = ""
     try:
-        _network_jitter(0.2, 0.35)
         resp = request_with_retry(
             "GET",
             url,
             session_name="url_resolver",
-            session=resolver_session,
             timeout=8,
             allow_redirects=True,
             headers={
@@ -2009,23 +1967,42 @@ def _resolve_final_url_optimized(
             logger.debug("Resolved via HTTP redirect: %s", resolved)
             _set_cached_resolve_value(url, resolved)
             return resolved
-        response_text = resp.text or ""
+
+        location_match = re.search(
+            r'(?:window\.location(?:\.href)?\s*=\s*|url=|content=["\']\d+;\s*url=)["\']?(https?://[^"\'\s;]+)',
+            resp.text,
+            re.IGNORECASE,
+        )
+        if location_match:
+            candidate = location_match.group(1)
+            if "news.google.com" not in urlparse(candidate).netloc.lower():
+                logger.debug("Resolved via page redirect hint: %s", candidate)
+                _set_cached_resolve_value(url, candidate)
+                return candidate
     except Exception as exc:
         logger.warning(f"HTTP resolution failed for {url}: {exc}")
 
-    location_match = _URL_REDIRECT_HINT_RE.search(response_text)
-    if location_match:
-        candidate = unquote(location_match.group(1))
-        if candidate and "news.google.com" not in urlparse(candidate).netloc.lower():
-            logger.debug("Resolved via page redirect hint: %s", candidate)
-            _set_cached_resolve_value(url, candidate)
-            return candidate
+    if uc is None:
+        logger.warning(f"Failed to resolve (no Selenium): {url}")
+        fallback_url = search_real_url(article_title or "", expected_source=source_hint)
+        _set_cached_resolve_value(url, fallback_url)
+        return fallback_url
 
-    query_target = _extract_google_target_from_url(url)
-    if query_target:
-        logger.debug("Resolved via Google URL query target: %s", query_target)
-        _set_cached_resolve_value(url, query_target)
-        return query_target
+    try:
+        logger.debug("Using Selenium fallback for URL resolution")
+        driver = get_driver()
+        driver.get(url)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            current = driver.current_url
+            if current and "news.google.com" not in urlparse(current).netloc.lower():
+                logger.debug("Resolved via Selenium: %s", current)
+                _set_cached_resolve_value(url, current)
+                return current
+            time.sleep(0.4)
+    except Exception as exc:
+        logger.warning(f"Selenium resolution error: {exc}")
+        close_driver()
 
     fallback_url = search_real_url(article_title or "", expected_source=source_hint)
     if fallback_url:
@@ -2033,44 +2010,15 @@ def _resolve_final_url_optimized(
         _set_cached_resolve_value(url, fallback_url)
         return fallback_url
 
-    if uc is not None:
-        try:
-            logger.debug("Using Selenium fallback for URL resolution")
-            driver = get_driver()
-            _network_jitter(0.25, 0.45)
-            driver.get(url)
-            deadline = time.time() + 8
-            while time.time() < deadline:
-                current = driver.current_url
-                if current and "news.google.com" not in urlparse(current).netloc.lower():
-                    logger.debug("Resolved via Selenium: %s", current)
-                    _set_cached_resolve_value(url, current)
-                    return current
-                time.sleep(0.4)
-        except Exception as exc:
-            logger.warning(f"Selenium resolution error: {exc}")
-            close_driver()
-    else:
-        logger.warning(f"Failed to resolve with Selenium unavailable: {url}")
-
     _set_cached_resolve_value(url, None)
     logger.warning(f"Failed to resolve: {url}")
     return None
 
 
 def _fetch_rss_source_entries(url: str) -> list[dict]:
-    rss_session = get_http_session(session_name="rss", pool_connections=12, pool_maxsize=24)
     try:
         try:
-            _network_jitter(0.2, 0.4)
-            rss_resp = request_with_retry(
-                "GET",
-                url,
-                session_name="rss",
-                session=rss_session,
-                headers=RSS_HEADERS,
-                timeout=15,
-            )
+            rss_resp = request_with_retry("GET", url, session_name="rss", headers=RSS_HEADERS, timeout=15)
             feed = feedparser.parse(rss_resp.content)
         except Exception as fetch_exc:
             logger.warning(f"HTTP fetch failed for {url}: {fetch_exc} - falling back to feedparser direct")
@@ -2464,16 +2412,13 @@ def _extract_page_date_requests_only_optimized(url: str) -> datetime | None:
     domain = normalize_domain(url)
 
     url_path_date = _extract_date_from_url_path(url)
-    page_date_session = get_http_session(session_name="page_date", pool_connections=10, pool_maxsize=20)
 
     if _matches_domain(domain, "alriyadh.com"):
         try:
-            _network_jitter(0.2, 0.4)
             resp_ar = request_with_retry(
                 "GET",
                 url,
                 session_name="page_date",
-                session=page_date_session,
                 timeout=12,
                 allow_redirects=True,
                 verify=False,
@@ -2527,12 +2472,10 @@ def _extract_page_date_requests_only_optimized(url: str) -> datetime | None:
         return None
 
     try:
-        _network_jitter(0.2, 0.4)
         resp = request_with_retry(
             "GET",
             url,
             session_name="page_date",
-            session=page_date_session,
             timeout=10,
             allow_redirects=True,
         )

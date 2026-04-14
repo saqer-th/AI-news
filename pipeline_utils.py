@@ -21,8 +21,6 @@ DEFAULT_BROWSER_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Connection": "keep-alive",
 }
 
 RSS_HEADERS = {
@@ -30,8 +28,7 @@ RSS_HEADERS = {
     "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
 }
 
-_GLOBAL_SESSION_CACHE: dict[tuple[str, int, int], requests.Session] = {}
-_GLOBAL_SESSION_LOCK = threading.Lock()
+_SESSION_LOCAL = threading.local()
 
 
 class TTLMemoryCache:
@@ -87,21 +84,25 @@ def get_http_session(
     pool_connections: int = 10,
     pool_maxsize: int = 20,
 ) -> requests.Session:
+    sessions = getattr(_SESSION_LOCAL, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _SESSION_LOCAL.sessions = sessions
+
     cache_key = (session_name, int(pool_connections), int(pool_maxsize))
-    with _GLOBAL_SESSION_LOCK:
-        session = _GLOBAL_SESSION_CACHE.get(cache_key)
-        if session is None:
-            session = requests.Session()
-            adapter = HTTPAdapter(
-                max_retries=_build_retry(),
-                pool_connections=max(1, int(pool_connections)),
-                pool_maxsize=max(1, int(pool_maxsize)),
-            )
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            session.headers.update(DEFAULT_BROWSER_HEADERS)
-            _GLOBAL_SESSION_CACHE[cache_key] = session
-        return session
+    session = sessions.get(cache_key)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            max_retries=_build_retry(),
+            pool_connections=max(1, int(pool_connections)),
+            pool_maxsize=max(1, int(pool_maxsize)),
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update(DEFAULT_BROWSER_HEADERS)
+        sessions[cache_key] = session
+    return session
 
 
 def request_with_retry(
@@ -109,16 +110,15 @@ def request_with_retry(
     url: str,
     *,
     session_name: str = "default",
-    session: requests.Session | None = None,
     headers: dict[str, str] | None = None,
     timeout: int | float = 10,
     **kwargs,
 ) -> requests.Response:
-    active_session = session or get_http_session(session_name=session_name)
+    session = get_http_session(session_name=session_name)
     merged_headers = dict(DEFAULT_BROWSER_HEADERS)
     if headers:
         merged_headers.update(headers)
-    return active_session.request(method=method.upper(), url=url, headers=merged_headers, timeout=timeout, **kwargs)
+    return session.request(method=method.upper(), url=url, headers=merged_headers, timeout=timeout, **kwargs)
 
 
 def utc_now_iso() -> str:
