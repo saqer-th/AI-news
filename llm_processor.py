@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -44,9 +45,12 @@ PROCESSED_CACHE_MAX_ENTRIES = 1500
 ARTICLE_CACHE_TTL_SECONDS = 36 * 3600
 ARTICLE_CACHE_MAX_ENTRIES = 800
 LLM_MAX_WORKERS = max(1, int(os.getenv("LLM_MAX_WORKERS", "2")))
+OLLAMA_GLOBAL_MAX_CONCURRENT = max(1, int(os.getenv("OLLAMA_GLOBAL_MAX_CONCURRENT", str(LLM_MAX_WORKERS))))
+OLLAMA_SLOT_TIMEOUT_SECONDS = max(1, int(os.getenv("OLLAMA_SLOT_TIMEOUT_SECONDS", "180")))
 MIN_CONTENT_LENGTH = 300
 ARTICLE_MAX_AGE_DAYS = 7
 LLM_RETRY_LIMIT = 3
+_OLLAMA_REQUEST_SEMAPHORE = threading.BoundedSemaphore(OLLAMA_GLOBAL_MAX_CONCURRENT)
 ALLOWED_CATEGORIES = {
     "\u0627\u0642\u062a\u0635\u0627\u062f",
     "\u062a\u0642\u0646\u064a\u0629",
@@ -205,6 +209,19 @@ def fallback_summary_line(language: str) -> str:
         if normalize_content_language(language) == "en"
         else "\u0644\u0645 \u062a\u062a\u0648\u0641\u0631 \u062a\u0641\u0627\u0635\u064a\u0644 \u0643\u0627\u0641\u064a\u0629."
     )
+
+
+@contextlib.contextmanager
+def _ollama_request_slot():
+    acquired = _OLLAMA_REQUEST_SEMAPHORE.acquire(timeout=OLLAMA_SLOT_TIMEOUT_SECONDS)
+    if not acquired:
+        raise TimeoutError(
+            f"Timed out waiting for an Ollama slot after {OLLAMA_SLOT_TIMEOUT_SECONDS} seconds."
+        )
+    try:
+        yield
+    finally:
+        _OLLAMA_REQUEST_SEMAPHORE.release()
 
 DOMAIN_SELECTORS = {
     "argaam.com": [
@@ -1305,14 +1322,15 @@ def _summarize_3_lines_optimized(news_text: str, language: str | None = None) ->
     last_lines = []
     for attempt in range(1, 3):
         try:
-            response = request_with_retry(
-                "POST",
-                "http://localhost:11434/api/generate",
-                session_name="ollama_summary",
-                json=payload,
-                timeout=90,
-                headers={"Content-Type": "application/json"},
-            )
+            with _ollama_request_slot():
+                response = request_with_retry(
+                    "POST",
+                    "http://localhost:11434/api/generate",
+                    session_name="ollama_summary",
+                    json=payload,
+                    timeout=90,
+                    headers={"Content-Type": "application/json"},
+                )
             response.raise_for_status()
             raw_output = response.json().get("response", "")
             lines = clean_summary_lines(raw_output, normalized_language)
@@ -1343,14 +1361,15 @@ def _call_ollama_with_retries_optimized(news_item: dict, content_to_use: str, la
     last_error = None
     for attempt in range(1, LLM_RETRY_LIMIT + 1):
         try:
-            response = request_with_retry(
-                "POST",
-                OLLAMA_API_URL,
-                session_name="ollama_structured",
-                json=payload,
-                timeout=90,
-                headers={"Content-Type": "application/json"},
-            )
+            with _ollama_request_slot():
+                response = request_with_retry(
+                    "POST",
+                    OLLAMA_API_URL,
+                    session_name="ollama_structured",
+                    json=payload,
+                    timeout=90,
+                    headers={"Content-Type": "application/json"},
+                )
             response.raise_for_status()
             raw_output = response.json().get("response", "")
             parsed = parse_llm_json(raw_output)

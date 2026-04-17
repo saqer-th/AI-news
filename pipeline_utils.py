@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -29,6 +30,8 @@ RSS_HEADERS = {
 }
 
 _SESSION_LOCAL = threading.local()
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
 
 
 class TTLMemoryCache:
@@ -149,6 +152,16 @@ def load_json_cache(path: Path) -> dict[str, Any]:
     return {}
 
 
+def _get_path_lock(path: Path) -> threading.Lock:
+    key = str(path.absolute())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+    return lock
+
+
 def prune_json_cache(cache: dict[str, Any], *, max_entries: int, ttl_seconds: int) -> dict[str, Any]:
     cutoff = datetime.now(timezone.utc).timestamp() - max(1, int(ttl_seconds))
     valid_items: list[tuple[float, str, Any]] = []
@@ -169,9 +182,24 @@ def prune_json_cache(cache: dict[str, Any], *, max_entries: int, ttl_seconds: in
 
 
 def save_json_cache(path: Path, cache: dict[str, Any], *, max_entries: int, ttl_seconds: int) -> None:
-    pruned = prune_json_cache(cache, max_entries=max_entries, ttl_seconds=ttl_seconds)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+    lock = _get_path_lock(path)
+    with lock:
+        existing = load_json_cache(path)
+        merged = dict(existing)
+        merged.update(cache)
+        pruned = prune_json_cache(merged, max_entries=max_entries, ttl_seconds=ttl_seconds)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{threading.get_ident()}")
+        try:
+            temp_path.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
 
 def stable_hash(*parts: Any) -> str:

@@ -1,10 +1,11 @@
 __pycache__/
 .cache/
 *.pyc
-
+venv/
 weekly_news.html
 weekly_news.pdf
 weekly_news.png
 weekly_news_interactive.html
 weekly_news_interactive.jpg
 weekly_news_interactive.pdf
+.pycache_tmp/

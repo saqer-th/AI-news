@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import streamlit as st
 
@@ -11,6 +12,9 @@ CARD_COLUMNS = 5
 LATEST_CACHE_PATH = Path("cache") / "latest.json"
 
 st.set_page_config(page_title="AI Financial News", layout="wide", page_icon="\U0001f4f0")
+
+if "session_token" not in st.session_state:
+    st.session_state.session_token = uuid4().hex[:10]
 
 st.markdown(
     """
@@ -247,8 +251,15 @@ st.markdown(
             text-decoration: none;
             transition: color .18s;
         }
-        .card-link:hover { color: #5eead4; }
-        .card-link::after { content: '\2192'; }
+        .card-link::after {
+        content: ' →';
+        margin-left: 6px;
+        transition: transform 0.2s ease;
+        }
+
+        .card-link:hover::after {
+        transform: translateX(4px);
+        }
 
         /* --- Review Page --- */
         .review-head {
@@ -673,9 +684,13 @@ else:
         else:
             with st.status("Generating final outputs...", expanded=True) as status:
                 base_dir = os.path.dirname(os.path.abspath(__file__))
-                html_path = os.path.join(base_dir, "weekly_news_interactive.html")
-                pdf_path = os.path.join(base_dir, "weekly_news_interactive.pdf")
-                img_path = os.path.join(base_dir, "weekly_news_interactive.jpg")
+                export_dir = os.path.join(base_dir, "exports")
+                os.makedirs(export_dir, exist_ok=True)
+                export_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                export_stem = f"weekly_news_interactive_{st.session_state.session_token}_{export_stamp}"
+                html_path = os.path.join(export_dir, f"{export_stem}.html")
+                pdf_path = os.path.join(export_dir, f"{export_stem}.pdf")
+                img_path = os.path.join(export_dir, f"{export_stem}.jpg")
 
                 edited_news_pool.sort(key=lambda item: item.get("final_score", 0), reverse=True)
                 export_result = export_report_assets(
@@ -688,6 +703,9 @@ else:
                     custom_en_date=custom_en_date or None,
                 )
                 st.write("HTML report generated.")
+                html_path = export_result.get("html_path", html_path)
+                pdf_path = export_result.get("pdf_path", pdf_path)
+                img_path = export_result.get("image_path", img_path)
                 pdf_success = export_result.get("pdf_success", False)
                 img_success = export_result.get("image_success", False)
                 export_error = export_result.get("export_error", "")

@@ -35,7 +35,8 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = setup_logger(__name__)
-_CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+BASE_DIR = Path(__file__).resolve().parent
+_CACHE_DIR = BASE_DIR / ".cache"
 _RESOLVE_CACHE_PATH = _CACHE_DIR / "resolved_urls.json"
 _RESOLVE_DISK_CACHE = load_json_cache(_RESOLVE_CACHE_PATH)
 _RESOLVE_CACHE = TTLMemoryCache(maxsize=4096, ttl_seconds=12 * 3600)
@@ -45,8 +46,68 @@ _SEARCH_DISK_CACHE = load_json_cache(_SEARCH_CACHE_PATH)
 _SEARCH_CACHE = TTLMemoryCache(maxsize=2048, ttl_seconds=12 * 3600)
 _SEARCH_CACHE_DIRTY = False
 _driver_lock = threading.RLock()
-_visible_driver_lock = threading.RLock()
 _driver = None
+_driver_disabled_for_run = False
+
+_CHROME_VERSION_MAIN = 146
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_FALSY_VALUES = {"0", "false", "no", "off"}
+_TASK_SCHEDULER_CWD = (Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32").resolve()
+
+
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in _TRUTHY_VALUES
+
+
+def _is_falsy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in _FALSY_VALUES
+
+
+@lru_cache(maxsize=1)
+def _is_task_scheduler_environment() -> bool:
+    session_name = (os.environ.get("SESSIONNAME") or "").strip().lower()
+    if session_name in {"services", "service"}:
+        return True
+    if os.environ.get("TASK_NAME") or os.environ.get("SCHEDULED_TASK_NAME"):
+        return True
+    try:
+        return Path.cwd().resolve() == _TASK_SCHEDULER_CWD
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _should_force_headless() -> bool:
+    override = os.environ.get("NEWS_PIPELINE_HEADLESS")
+    if _is_truthy(override):
+        return True
+    if _is_falsy(override):
+        if _is_task_scheduler_environment():
+            logger.warning("Ignoring NEWS_PIPELINE_HEADLESS=0 in Task Scheduler context; forcing headless mode.")
+            return True
+        return False
+    # Default to headless for production stability; Task Scheduler always remains headless.
+    return True
+
+
+def _build_driver_options() -> "uc.ChromeOptions":
+    options = uc.ChromeOptions()
+    if _should_force_headless():
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    return options
+
+
+def _disable_driver_for_run(reason: str) -> None:
+    global _driver_disabled_for_run
+    _driver_disabled_for_run = True
+    logger.warning("Selenium fallback disabled for this run: %s", reason)
+    close_driver(reset_state=False)
 
 
 def _emit_progress(progress_callback, *, stage: str, message: str, progress: float | None = None, **details) -> None:
@@ -657,82 +718,56 @@ def _cleanup_stale_chromedriver(force: bool = False) -> None:
 
 
 def get_driver():
-    global _driver
-
-    if _driver is None:
+    global _driver, _driver_disabled_for_run
+    with _driver_lock:
+        if _driver is not None:
+            return _driver
+        if _driver_disabled_for_run:
+            return None
         if uc is None:
-            raise RuntimeError("undetected_chromedriver is unavailable")
+            logger.warning("undetected_chromedriver is unavailable; Selenium fallback is disabled.")
+            _driver_disabled_for_run = True
+            return None
 
         _cleanup_stale_chromedriver()
+        options = _build_driver_options()
+        last_exc: Exception | None = None
 
-        options = uc.ChromeOptions()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-gpu")
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            # Pin to the major version of the installed Chrome browser.
-            # If Chrome updates, bump this number to match.
+        for attempt in (1, 2):
             try:
-                _driver = uc.Chrome(options=options, version_main=146)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    _driver = uc.Chrome(options=options, version_main=_CHROME_VERSION_MAIN)
+                logger.info(
+                    "Created undetected_chromedriver (headless=%s, scheduler=%s, version_main=%s).",
+                    _should_force_headless(),
+                    _is_task_scheduler_environment(),
+                    _CHROME_VERSION_MAIN,
+                )
+                return _driver
             except Exception as exc:
-                # WinError 183 can still race on first try — clean up and retry once
-                if "183" in str(exc) or "already exists" in str(exc).lower():
-                    logger.warning(f"ChromeDriver init race error, retrying after cleanup: {exc}")
+                last_exc = exc
+                if attempt == 1 and ("183" in str(exc) or "already exists" in str(exc).lower()):
+                    logger.warning("ChromeDriver init race, retrying once after cleanup: %s", exc)
                     _cleanup_stale_chromedriver(force=True)
                     time.sleep(1)
-                    _driver = uc.Chrome(options=options, version_main=146)
-                else:
-                    raise
+                    continue
+                break
 
-    return _driver
-
-
-def close_driver() -> None:
-    global _driver
-    if _driver:
-        try:
-            _driver.quit()
-        finally:
-            _driver = None
+        _driver_disabled_for_run = True
+        logger.error(
+            "Failed to initialize undetected_chromedriver; continuing without Selenium fallback: %s",
+            last_exc,
+        )
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Visible (non-headless) Chrome driver — used for sites that block headless
-# ---------------------------------------------------------------------------
-_visible_driver = None
-
-
-def get_visible_driver(force_new: bool = False):
-    """Return a regular, VISIBLE Chrome driver (no headless).
-
-    Some sites (e.g. maaal.com) actively detect and block headless browsers.
-    Regular Selenium with a visible window bypasses this.
-    """
-    global _visible_driver
-    with _visible_driver_lock:
-        if force_new:
-            close_visible_driver()
-
-        if _visible_driver is None:
-            try:
-                from selenium import webdriver as _sw
-                from selenium.webdriver.chrome.options import Options as _ChromeOpts
-                opts = _ChromeOpts()
-                # No --headless flag — deliberately visible
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-                opts.add_experimental_option("useAutomationExtension", False)
-                _visible_driver = _sw.Chrome(options=opts)
-            except Exception as exc:
-                raise RuntimeError(f"Could not start visible Chrome: {exc}") from exc
-        return _visible_driver
-
-
-def close_visible_driver() -> None:
-    global _visible_driver
-    with _visible_driver_lock:
-        driver = _visible_driver
-        _visible_driver = None
+def close_driver(*, reset_state: bool = False) -> None:
+    global _driver, _driver_disabled_for_run
+    with _driver_lock:
+        driver = _driver
+        _driver = None
+        if reset_state:
+            _driver_disabled_for_run = False
     if driver:
         with contextlib.suppress(Exception):
             driver.quit()
@@ -1014,33 +1049,31 @@ def resolve_final_url(url: str, article_title: str | None = None, source_hint: s
     except Exception as exc:
         logger.warning(f"HTTP resolution failed for {url}: {exc}")
 
-    # --- Strategy 2: Selenium with explicit wait for URL change ---
-    if uc is None:
-        logger.warning(f"Failed to resolve (no Selenium): {url}")
-        fallback_url = search_real_url(article_title or "", expected_source=source_hint)
-        _RESOLVE_CACHE[url] = fallback_url
-        return fallback_url
+    # --- Strategy 2: Selenium fallback (single shared UC driver) ---
+    driver = get_driver()
+    if driver is None:
+        logger.warning("Skipping Selenium URL resolution fallback (driver unavailable): %s", url)
+    else:
+        try:
+            logger.info("Using Selenium fallback for URL resolution: %s", url)
+            driver.get(url)
 
-    try:
-        logger.debug("Using Selenium fallback for URL resolution")
-        driver = get_driver()
-        driver.get(url)
-
-        # Wait up to 8 s for the URL to leave news.google.com
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            current = driver.current_url
-            if current and "news.google.com" not in urlparse(current).netloc.lower():
-                logger.debug(f"Resolved via Selenium: {current}")
-                _RESOLVE_CACHE[url] = current
-                return current
-            time.sleep(0.4)
-    except Exception as exc:
-        logger.warning(f"Selenium resolution error: {exc}")
-        close_driver()
+            # Wait up to 8 s for the URL to leave news.google.com
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                current = driver.current_url
+                if current and "news.google.com" not in urlparse(current).netloc.lower():
+                    logger.debug(f"Resolved via Selenium: {current}")
+                    _RESOLVE_CACHE[url] = current
+                    return current
+                time.sleep(0.4)
+        except Exception as exc:
+            logger.warning(f"Selenium resolution error: {exc}")
+            _disable_driver_for_run("runtime Selenium URL resolution error")
 
     fallback_url = search_real_url(article_title or "", expected_source=source_hint)
     if fallback_url:
+        logger.info("Falling back to title search for unresolved URL: %s", url)
         logger.info(f"Resolved Google News URL via title-search fallback: {fallback_url}")
         _RESOLVE_CACHE[url] = fallback_url
         return fallback_url
@@ -1159,70 +1192,45 @@ def _extract_spa_date_from_html(html_text: str) -> datetime | None:
 
 def extract_page_date(url: str) -> datetime | None:
     domain = normalize_domain(url)
+    parsed = extract_page_date_requests_only(url)
+    if parsed:
+        return parsed
 
-    # alriyadh.com works fine with plain requests (div.article-time time)
-    # Only these sites genuinely need Selenium
-    _SELENIUM_DOMAINS = {"sabq.org", "maaal.com"}
-    if any(_matches_domain(domain, d) for d in _SELENIUM_DOMAINS):
-        try:
-            driver = get_driver()
-            driver.get(url)
-            driver.implicitly_wait(3)
+    # Keep Selenium as a targeted fallback only for maaal.com.
+    if not _matches_domain(domain, "maaal.com"):
+        return None
 
-            source = driver.page_source
+    driver = get_driver()
+    if driver is None:
+        logger.warning("Skipping Selenium date fallback (driver unavailable): %s", url)
+        return None
 
-            if _matches_domain(domain, "sabq.org"):
-                m = re.search(r"\d{1,2}\s+\S+\s+\d{4}.*?في.*", source, re.DOTALL)
-                if m:
-                    parsed = parse_page_date_text(m.group(0))
+    try:
+        logger.info("Using Selenium fallback for page-date extraction: %s", url)
+        driver.get(url)
+        time.sleep(4)
+        if _SeleniumBy is not None:
+            candidate_selectors = [
+                "span.text-fontColorSecondary",
+                "[class*='text-fontColorSecondary']",
+            ]
+            for selector in candidate_selectors:
+                for element in driver.find_elements(_SeleniumBy.CSS_SELECTOR, selector):
+                    date_text = (element.text or "").strip()
+                    if not date_text:
+                        continue
+                    parsed = parse_page_date_text(date_text)
                     if parsed:
                         return parsed
-
-            if _matches_domain(domain, "maaal.com"):
-                # maaal.com blocks headless browsers — use a visible Chrome window
-                vis = None
-                try:
-                    vis = get_visible_driver(force_new=True)
-                    vis.get(url)
-                    time.sleep(5)  # wait for JS to render the date
-                    if _SeleniumBy is not None:
-                        candidate_selectors = [
-                            "span.text-fontColorSecondary",
-                            "[class*='text-fontColorSecondary']",
-                        ]
-                        for selector in candidate_selectors:
-                            for el in vis.find_elements(_SeleniumBy.CSS_SELECTOR, selector):
-                                date_text = (el.text or "").strip()
-                                if not date_text:
-                                    continue
-                                logger.debug(f"maaal.com visible driver text: {date_text!r}")
-                                parsed = parse_page_date_text(date_text)
-                                if parsed:
-                                    return parsed
-                    parsed = _extract_maaal_date_from_html(vis.page_source)
-                    if parsed:
-                        return parsed
-                except Exception as e:
-                    logger.warning(f"maaal.com visible driver error for {url}: {e}")
-                finally:
-                    close_visible_driver()
-
-            if _matches_domain(domain, "spa.gov.sa"):
-                # Accept date with OR without the Arabic م/هـ suffix
-                m = re.search(r"\d{1,2}\s+[\u0600-\u06FF]+\s+\d{4}(?:\s*[مهـ])?", source)
-                if m:
-                    parsed = parse_page_date_text(m.group(0))
-                    if parsed:
-                        return parsed
-
-        except Exception as e:
-            logger.warning(f"Selenium date extraction error for {url}: {e}")
-
-    return extract_page_date_requests_only(url)
+        return _extract_maaal_date_from_html(driver.page_source)
+    except Exception as exc:
+        logger.warning("Selenium date extraction error for %s: %s", url, exc)
+        _disable_driver_for_run("runtime Selenium date extraction error")
+        return None
 
 
 def extract_page_date_requests_only(url: str) -> datetime | None:
-    """Lightweight HTTP-only date extraction. Used as the fallback after Selenium."""
+    """Lightweight HTTP-first date extraction."""
     domain = normalize_domain(url)
 
     # ------------------------------------------------------------------
@@ -1793,7 +1801,7 @@ def fetch_valid_news(target: int = 35, max_batches: int = 6, days_back: int = 7)
     finally:
         _persist_resolve_cache()
         _persist_search_cache()
-        close_driver()
+        close_driver(reset_state=True)
 
 
 def fetch_rss_news(limit: int = 35, days_back: int = 7, enforce_language_balance: bool = True) -> list:
@@ -1982,30 +1990,28 @@ def _resolve_final_url_optimized(
     except Exception as exc:
         logger.warning(f"HTTP resolution failed for {url}: {exc}")
 
-    if uc is None:
-        logger.warning(f"Failed to resolve (no Selenium): {url}")
-        fallback_url = search_real_url(article_title or "", expected_source=source_hint)
-        _set_cached_resolve_value(url, fallback_url)
-        return fallback_url
-
-    try:
-        logger.debug("Using Selenium fallback for URL resolution")
-        driver = get_driver()
-        driver.get(url)
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            current = driver.current_url
-            if current and "news.google.com" not in urlparse(current).netloc.lower():
-                logger.debug("Resolved via Selenium: %s", current)
-                _set_cached_resolve_value(url, current)
-                return current
-            time.sleep(0.4)
-    except Exception as exc:
-        logger.warning(f"Selenium resolution error: {exc}")
-        close_driver()
+    driver = get_driver()
+    if driver is None:
+        logger.warning("Skipping Selenium URL resolution fallback (driver unavailable): %s", url)
+    else:
+        try:
+            logger.info("Using Selenium fallback for URL resolution: %s", url)
+            driver.get(url)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                current = driver.current_url
+                if current and "news.google.com" not in urlparse(current).netloc.lower():
+                    logger.debug("Resolved via Selenium: %s", current)
+                    _set_cached_resolve_value(url, current)
+                    return current
+                time.sleep(0.4)
+        except Exception as exc:
+            logger.warning(f"Selenium resolution error: {exc}")
+            _disable_driver_for_run("runtime Selenium URL resolution error")
 
     fallback_url = search_real_url(article_title or "", expected_source=source_hint)
     if fallback_url:
+        logger.info("Falling back to title search for unresolved URL: %s", url)
         logger.info(f"Resolved Google News URL via title-search fallback: {fallback_url}")
         _set_cached_resolve_value(url, fallback_url)
         return fallback_url
@@ -2399,8 +2405,7 @@ def _fetch_valid_news_optimized(
     finally:
         _persist_resolve_cache()
         _persist_search_cache()
-        close_driver()
-        close_visible_driver()
+        close_driver(reset_state=True)
 
 
 resolve_final_url = _resolve_final_url_optimized
@@ -2530,3 +2535,4 @@ def _extract_page_date_requests_only_optimized(url: str) -> datetime | None:
 
 
 extract_page_date_requests_only = _extract_page_date_requests_only_optimized
+
