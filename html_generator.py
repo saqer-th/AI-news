@@ -1,4 +1,3 @@
-import base64
 import html as html_lib
 import os
 import re
@@ -11,24 +10,23 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-import requests
 from hijri_converter import Gregorian
 
-from pipeline_utils import request_with_retry
 from utils import setup_logger
 
 logger = setup_logger(__name__)
 
 FALLBACK_IMAGE_URL = "https://images.unsplash.com/photo-1542744173-8e7e53415bb0?q=80&w=1200&auto=format&fit=crop"
-_IMAGE_DATA_CACHE = {}
 _MIN_BRAND_ASSET_BYTES = 64
 _PROJECT_DIR = Path(__file__).resolve().parent
 _DEFAULT_LOGO_CANDIDATES = [
+    os.getenv("NEWS_AI_LOGO_URL", ""),
     os.getenv("NEWS_AI_LOGO_PATH", ""),
     str(_PROJECT_DIR / "assets" / "logo.png"),
     str(_PROJECT_DIR / "assets" / "simah_logo.png"),
 ]
 _DEFAULT_FOOTER_CANDIDATES = [
+    os.getenv("NEWS_AI_FOOTER_URL", ""),
     os.getenv("NEWS_AI_FOOTER_PATH", ""),
     str(_PROJECT_DIR / "assets" / "footer.png"),
     str(_PROJECT_DIR / "assets" / "simah_footer.png"),
@@ -47,23 +45,6 @@ def _normalize_outlook_width(email_width: int) -> int:
 def _outlook_content_width(email_width: int) -> int:
     # The card grid sits inside a 16px left + 16px right padded container.
     return max(560, int(email_width) - 32)
-
-
-def _guess_mime_type(path: str) -> str:
-    ext = Path(path).suffix.lower()
-    if ext == ".png":
-        return "image/png"
-    if ext == ".svg":
-        return "image/svg+xml"
-    if ext == ".webp":
-        return "image/webp"
-    return "image/jpeg"
-
-
-def _file_to_data_uri(path: str) -> str:
-    with open(path, "rb") as handle:
-        encoded = base64.b64encode(handle.read()).decode("utf-8")
-    return f"data:{_guess_mime_type(path)};base64,{encoded}"
 
 
 def _is_brand_asset_visually_valid(asset_path: Path) -> bool:
@@ -130,6 +111,11 @@ def resolve_brand_asset_data_uri(
         candidate_path = str(candidate or "").strip()
         if not candidate_path:
             continue
+
+        direct_url = safe_url(candidate_path, "")
+        if direct_url:
+            return direct_url
+
         try:
             asset_path = Path(candidate_path).expanduser().resolve()
         except Exception:
@@ -142,9 +128,9 @@ def resolve_brand_asset_data_uri(
             logger.warning(f"Skipped visually empty brand asset '{asset_path}'")
             continue
         try:
-            return _file_to_data_uri(str(asset_path))
+            return asset_path.as_uri()
         except Exception as exc:
-            logger.warning(f"Failed to encode brand asset '{asset_path}': {exc}")
+            logger.warning(f"Failed to resolve brand asset URL for '{asset_path}': {exc}")
     return ""
 
 
@@ -156,7 +142,7 @@ def build_bing_image_url(keyword: str) -> str:
 
 def is_safe_url(url: str) -> bool:
     parsed = urlparse(url or "")
-    return parsed.scheme in {"http", "https", "data"}
+    return parsed.scheme in {"http", "https"}
 
 
 def safe_url(url: str, fallback: str = "#") -> str:
@@ -176,38 +162,9 @@ def get_news_image_url(news: dict, prefer_original: bool = True) -> str:
     return safe_url(image_url, FALLBACK_IMAGE_URL)
 
 
-def fetch_image_data_uri(image_url: str) -> str:
-    cache_key = image_url.strip()
-    if cache_key in _IMAGE_DATA_CACHE:
-        return _IMAGE_DATA_CACHE[cache_key]
-
-    try:
-        response = request_with_retry(
-            "GET",
-            image_url,
-            timeout=10,
-            headers={
-                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                "Referer": image_url,
-            },
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0]
-        encoded = base64.b64encode(response.content).decode("utf-8")
-        result = f"data:{content_type};base64,{encoded}"
-        _IMAGE_DATA_CACHE[cache_key] = result
-        return result
-    except Exception as exc:
-        logger.warning(f"Failed to fetch image '{image_url}': {exc}")
-        return FALLBACK_IMAGE_URL
-
-
-
-def generate_base64_ai_image(news: dict) -> str:
+def generate_ai_image_src(news: dict) -> str:
     image_url = get_news_image_url(news, prefer_original=news.get("use_original_image", False))
-    if image_url.startswith("data:"):
-        return image_url
-    return fetch_image_data_uri(image_url)
+    return safe_url(image_url, FALLBACK_IMAGE_URL)
 
 
 CSS_STYLE = """
@@ -609,7 +566,7 @@ def generate_card_html(news: dict, index: int) -> str:
     title = html_lib.escape(str(news.get("title", "")).strip())
     link = html_lib.escape(safe_url(news.get("link", "")))
     source = html_lib.escape(str(news.get("source", "")).strip())
-    img_src = html_lib.escape(generate_base64_ai_image(news))
+    img_src = html_lib.escape(generate_ai_image_src(news))
     summary_html = render_summary(news.get("summary", []))
     source_html = f'<div class="card-source">{source}</div>' if source else ""
 
@@ -652,7 +609,7 @@ def _get_outlook_card_image_src(news: dict) -> str:
             return html_lib.escape(fallback_src)
     if preferred_src:
         return html_lib.escape(preferred_src)
-    return html_lib.escape(generate_base64_ai_image(news))
+    return html_lib.escape(generate_ai_image_src(news))
 
 
 def _outlook_card_text_block(news: dict) -> str:
